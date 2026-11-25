@@ -1,4 +1,4 @@
-import time 
+import time
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -24,13 +24,16 @@ class QuizGenerato(BaseModel):
 
 st.title("🧠 I Miei Quiz")
 
-# Navigazione a schede (molto comoda da telefono)
+# Navigazione a schede
 tab_esercitati, tab_crea = st.tabs(["📝 Esercitati", "➕ Crea Nuovo Quiz"])
 
 # ==========================================
 # SCHEDA 1: ESERCITATI CON I QUIZ SALVATI
 # ==========================================
 with tab_esercitati:
+    if st.button("🔄 Aggiorna elenco quiz"):
+        st.rerun()
+
     # Scarica tutti i quiz salvati nel database
     risposta_db = supabase.table("quiz").select("*").order("created_at", desc=True).execute()
     tutti_i_quiz = risposta_db.data
@@ -42,13 +45,21 @@ with tab_esercitati:
         materie = sorted(list(set(q["materia"] for q in tutti_i_quiz)))
         materia_scelta = st.selectbox("Scegli la materia:", materie)
 
-        # Filtra i quiz della materia selezionata
+        # Filtra i quiz della materia selezionata (include l'ID per evitare sovrascritture)
         quiz_materia = [q for q in tutti_i_quiz if q["materia"] == materia_scelta]
-        titoli = {q["titolo"]: q for q in quiz_materia}
+        titoli = {f"{q['titolo']} (#{q['id']})": q for q in quiz_materia}
         titolo_scelto = st.selectbox("Scegli il quiz:", list(titoli.keys()))
 
         quiz_attivo = titoli[titolo_scelto]
         domande = quiz_attivo["domande"]
+
+        # Menu a tendina per eliminare il quiz selezionato in sicurezza
+        with st.expander("🗑️ Elimina questo quiz"):
+            st.warning(f"Vuoi davvero eliminare **{quiz_attivo['titolo']}**? L'azione è irreversibile.")
+            if st.button("Conferma eliminazione", type="primary", key=f"del_{quiz_attivo['id']}"):
+                supabase.table("quiz").delete().eq("id", quiz_attivo["id"]).execute()
+                st.toast("Quiz eliminato!")
+                st.rerun()
 
         st.divider()
 
@@ -110,7 +121,7 @@ with tab_crea:
                     if esempi_quiz:
                         prompt += f"\nSegui rigorosamente lo stile, il tono e la difficoltà di questi esempi:\n{esempi_quiz}"
 
-                    response = None
+                    # Generazione con cambio automatico di modello in caso di 503 o 429
                     modelli_disponibili = [
                         "gemini-4-hydrogen",
                         "gemini-3.5-flash-lite",
@@ -130,7 +141,7 @@ with tab_crea:
                                     response_schema=QuizGenerato,
                                 ),
                             )
-                            break  # Ha funzionato, esce dal ciclo
+                            break
                         except Exception as err:
                             ultimo_errore = err
                             if "503" in str(err) or "429" in str(err):
@@ -141,6 +152,7 @@ with tab_crea:
 
                     if response is None:
                         raise ultimo_errore
+
                     quiz_pronto = QuizGenerato.model_validate_json(response.text)
 
                     # Salva il quiz nel database Supabase
