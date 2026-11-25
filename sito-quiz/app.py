@@ -53,13 +53,25 @@ with tab_esercitati:
         quiz_attivo = titoli[titolo_scelto]
         domande = quiz_attivo["domande"]
 
-        # Menu a tendina per eliminare il quiz selezionato in sicurezza
-        with st.expander("🗑️ Elimina questo quiz"):
-            st.warning(f"Vuoi davvero eliminare **{quiz_attivo['titolo']}**? L'azione è irreversibile.")
-            if st.button("Conferma eliminazione", type="primary", key=f"del_{quiz_attivo['id']}"):
-                supabase.table("quiz").delete().eq("id", quiz_attivo["id"]).execute()
-                st.toast("Quiz eliminato!")
-                st.rerun()
+        # Menu a tendina per eliminare il singolo quiz o l'intera materia in sicurezza
+        with st.expander("🗑️ Elimina quiz o materia"):
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("**Elimina solo questo quiz**")
+                st.caption(f"Rimuove '{quiz_attivo['titolo']}'.")
+                if st.button("Elimina quiz", type="secondary", key=f"del_quiz_{quiz_attivo['id']}"):
+                    supabase.table("quiz").delete().eq("id", quiz_attivo["id"]).execute()
+                    st.toast("Quiz eliminato!")
+                    st.rerun()
+
+            with col2:
+                st.markdown("**Elimina intera materia**")
+                st.caption(f"Rimuove '{materia_scelta}' e tutti i suoi {len(quiz_materia)} quiz.")
+                if st.button("Elimina materia", type="primary", key=f"del_mat_{materia_scelta}"):
+                    supabase.table("quiz").delete().eq("materia", materia_scelta).execute()
+                    st.toast(f"Materia '{materia_scelta}' eliminata!")
+                    st.rerun()
 
         st.divider()
 
