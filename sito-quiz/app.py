@@ -114,7 +114,7 @@ with tab_crea:
                     for tentativo in range(4):
                         try:
                             response = client_gemini.models.generate_content(
-                                model="gemini-3.8-flash",
+                                model="gemini-4-hydrogen",
                                 contents=[uploaded_file, prompt],
                                 config=types.GenerateContentConfig(
                                     response_mime_type="application/json",
