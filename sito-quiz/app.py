@@ -111,24 +111,36 @@ with tab_crea:
                         prompt += f"\nSegui rigorosamente lo stile, il tono e la difficoltà di questi esempi:\n{esempi_quiz}"
 
                     response = None
-                    for tentativo in range(4):
+                    modelli_disponibili = [
+                        "gemini-4-hydrogen",
+                        "gemini-3.5-flash-lite",
+                        "gemini-3.6-flash",
+                        "gemini-3.8-flash",
+                    ]
+                    response = None
+                    ultimo_errore = None
+
+                    for nome_modello in modelli_disponibili:
                         try:
                             response = client_gemini.models.generate_content(
-                                model="gemini-3.5-flash-lite",
+                                model=nome_modello,
                                 contents=[uploaded_file, prompt],
                                 config=types.GenerateContentConfig(
                                     response_mime_type="application/json",
                                     response_schema=QuizGenerato,
                                 ),
                             )
-                            break  # Se funziona, esce subito dal ciclo
+                            break  # Ha funzionato, esce dal ciclo
                         except Exception as err:
-                            if "503" in str(err) and tentativo < 3:
-                                attesa = (tentativo + 1) * 5
-                                st.toast(f"Server occupato, riprovo tra {attesa} secondi... (tentativo {tentativo + 2}/4)")
-                                time.sleep(attesa)
+                            ultimo_errore = err
+                            if "503" in str(err) or "429" in str(err):
+                                st.toast(f"{nome_modello} occupato, provo il prossimo modello...")
+                                time.sleep(2)
                             else:
                                 raise err
+
+                    if response is None:
+                        raise ultimo_errore
                     quiz_pronto = QuizGenerato.model_validate_json(response.text)
 
                     # Salva il quiz nel database Supabase
