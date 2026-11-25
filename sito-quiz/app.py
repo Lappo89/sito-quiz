@@ -110,7 +110,7 @@ with tab_crea:
                         prompt += f"\nSegui rigorosamente lo stile, il tono e la difficoltà di questi esempi:\n{esempi_quiz}"
 
                     response = client_gemini.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-3.8-flash",
                         contents=[uploaded_file, prompt],
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
