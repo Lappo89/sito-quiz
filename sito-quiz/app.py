@@ -8,6 +8,23 @@ from supabase import create_client
 # Impostazione ottimizzata per smartphone
 st.set_page_config(page_title="I Miei Quiz", page_icon="🧠", layout="centered")
 
+# ==========================================
+# CONTROLLO PASSWORD DI ACCESSO
+# ==========================================
+if "autenticato" not in st.session_state:
+    st.session_state["autenticato"] = False
+
+if not st.session_state["autenticato"]:
+    st.title("🔒 Accesso Riservato")
+    password_inserita = st.text_input("Inserisci la password per accedere ai tuoi quiz:", type="password")
+    if st.button("Accedi", type="primary", use_container_width=True):
+        if password_inserita == st.secrets["APP_PASSWORD"]:
+            st.session_state["autenticato"] = True
+            st.rerun()
+        else:
+            st.error("Password errata. Riprova.")
+    st.stop()
+
 # Connessione ai servizi tramite i "Secrets" di Streamlit
 client_gemini = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
