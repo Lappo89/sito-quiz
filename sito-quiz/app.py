@@ -1,3 +1,4 @@
+import hashlib
 import time
 from datetime import datetime
 import streamlit as st
@@ -9,30 +10,55 @@ from supabase import create_client
 # Impostazione ottimizzata per smartphone
 st.set_page_config(page_title="I Miei Quiz", page_icon="🧠", layout="centered")
 
+# Connessione ai servizi tramite i "Secrets" di Streamlit
+client_gemini = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+
+def cifra_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
 # ==========================================
-# CONTROLLO PASSWORD DI ACCESSO
+# CONTROLLO LOGIN (ADMIN E UTENTI)
 # ==========================================
 if "autenticato" not in st.session_state:
     st.session_state["autenticato"] = False
+if "ruolo" not in st.session_state:
+    st.session_state["ruolo"] = None
+if "utente_loggato" not in st.session_state:
+    st.session_state["utente_loggato"] = None
+if "profilo_attivo" not in st.session_state:
+    st.session_state["profilo_attivo"] = None
 
 if not st.session_state["autenticato"]:
     st.title("🔒 Accesso Riservato")
-    password_inserita = st.text_input("Inserisci la password per accedere ai tuoi quiz:", type="password")
+    username_inserito = st.text_input("Username (es. admin):").strip().lower()
+    password_inserita = st.text_input("Password:", type="password")
+
     if st.button("Accedi", type="primary", use_container_width=True):
-        if password_inserita == st.secrets["APP_PASSWORD"]:
+        if not username_inserito or not password_inserita:
+            st.warning("Inserisci sia lo username che la password.")
+        elif username_inserito == "admin" and password_inserita == st.secrets["APP_PASSWORD"]:
             st.session_state["autenticato"] = True
+            st.session_state["ruolo"] = "admin"
+            st.session_state["utente_loggato"] = "admin"
+            st.session_state["profilo_attivo"] = "admin"
             st.rerun()
         else:
-            st.error("Password errata. Riprova.")
+            # Controlla nella tabella utenti su Supabase
+            res = supabase.table("utenti").select("*").eq("username", username_inserito).execute()
+            if res.data and res.data[0]["password_hash"] == cifra_password(password_inserita):
+                st.session_state["autenticato"] = True
+                st.session_state["ruolo"] = "utente"
+                st.session_state["utente_loggato"] = username_inserito
+                st.session_state["profilo_attivo"] = username_inserito
+                st.rerun()
+            else:
+                st.error("Username o password errati. Riprova.")
     st.stop()
 
 # Stato per ricordare quale materia (quadrotto) è stata aperta
 if "materia_selezionata" not in st.session_state:
     st.session_state["materia_selezionata"] = None
-
-# Connessione ai servizi tramite i "Secrets" di Streamlit
-client_gemini = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 # Struttura rigorosa del quiz per Gemini
 class Domanda(BaseModel):
@@ -44,7 +70,7 @@ class Domanda(BaseModel):
 class QuizGenerato(BaseModel):
     domande: list[Domanda]
 
-# Frammento live per il timer della modalità Esame (si aggiorna ogni secondo)
+# Frammento live per il timer della modalità Esame
 @st.fragment(run_every=1)
 def mostra_timer_esame(quiz_id, fine_timestamp):
     rimanenti = int(fine_timestamp - time.time())
@@ -59,7 +85,7 @@ def mostra_timer_esame(quiz_id, fine_timestamp):
         else:
             st.info(f"⏱️ Tempo rimanente: **{minuti:02d}:{secondi:02d}**")
 
-# Funzione di supporto per calcolare la media dei punteggi (es. "4 / 5" -> 80%)
+# Calcolo media punteggi
 def calcola_media_percentuale(lista_quiz):
     percentuali = []
     for q in lista_quiz:
@@ -76,26 +102,70 @@ def calcola_media_percentuale(lista_quiz):
         return None
     return sum(percentuali) / len(percentuali)
 
-st.title("🧠 I Miei Quiz")
+# ==========================================
+# INTESTAZIONE E CAMBIO PROFILO (SOLO ADMIN)
+# ==========================================
+col_h1, col_h2 = st.columns([3, 1])
+with col_h1:
+    st.title("🧠 I Miei Quiz")
+with col_h2:
+    st.write("")
+    if st.button("🚪 Esci", use_container_width=True):
+        st.session_state.clear()
+        st.rerun()
 
-# Scarica tutti i quiz salvati nel database una volta sola
-risposta_db = supabase.table("quiz").select("*").order("created_at", desc=True).execute()
+# Se è Admin, carica la lista utenti e permette di entrare in qualsiasi profilo
+tutti_gli_utenti = []
+if st.session_state["ruolo"] == "admin":
+    res_utenti = supabase.table("utenti").select("username").order("username").execute()
+    tutti_gli_utenti = [u["username"] for u in (res_utenti.data or [])]
+    lista_profili = ["admin"] + tutti_gli_utenti
+
+    if st.session_state["profilo_attivo"] not in lista_profili:
+        st.session_state["profilo_attivo"] = "admin"
+
+    profilo_scelto = st.selectbox(
+        "👑 Profilo attivo (solo Admin):",
+        lista_profili,
+        index=lista_profili.index(st.session_state["profilo_attivo"]),
+        key="selettore_profilo_admin"
+    )
+    if profilo_scelto != st.session_state["profilo_attivo"]:
+        st.session_state["profilo_attivo"] = profilo_scelto
+        st.session_state["materia_selezionata"] = None
+        st.rerun()
+else:
+    st.caption(f"👤 Profilo connesso: **{st.session_state['utente_loggato']}**")
+
+profilo_attivo = st.session_state["profilo_attivo"]
+
+# Scarica SOLO i quiz del profilo attivo
+risposta_db = (
+    supabase.table("quiz")
+    .select("*")
+    .eq("proprietario", profilo_attivo)
+    .order("created_at", desc=True)
+    .execute()
+)
 tutti_i_quiz = risposta_db.data or []
 
-# Navigazione principale a 2 schede pulite
-tab_materie, tab_crea = st.tabs(["📚 Le Mie Materie", "➕ Crea Nuovo"])
+# Schede principali (Admin ha anche Gestione Utenti)
+if st.session_state["ruolo"] == "admin":
+    tab_materie, tab_crea, tab_utenti = st.tabs(["📚 Le Mie Materie", "➕ Crea Nuovo", "👑 Gestione Utenti"])
+else:
+    tab_materie, tab_crea = st.tabs(["📚 Le Mie Materie", "➕ Crea Nuovo"])
+    tab_utenti = None
 
 # ==========================================
-# SCHEDA 1: LE MIE MATERIE (QUADROTTI -> DA FARE / COMPLETATI)
+# SCHEDA 1: LE MIE MATERIE
 # ==========================================
 with tab_materie:
     materie = sorted(list(set(q["materia"] for q in tutti_i_quiz)))
 
-    # Se la materia aperta non esiste più (eliminata), torna alla griglia
     if st.session_state["materia_selezionata"] not in materie:
         st.session_state["materia_selezionata"] = None
 
-    # VISTA 1: GRIGLIA DI QUADROTTI ALL'APERTURA
+    # VISTA 1: GRIGLIA DI QUADROTTI
     if st.session_state["materia_selezionata"] is None:
         if materie:
             if st.button("🔄 Aggiorna"):
@@ -112,12 +182,11 @@ with tab_materie:
                         with col:
                             if st.button(
                                 f"📚 **{mat}**\n\n{n_da_fare} da fare • {n_comp} completati",
-                                key=f"card_{mat}",
+                                key=f"card_{profilo_attivo}_{mat}",
                                 use_container_width=True
                             ):
                                 st.session_state["materia_selezionata"] = mat
                                 st.rerun()
-        # Se non ci sono materie, lo spazio rimane vuoto
 
     # VISTA 2: DENTRO LA MATERIA SELEZIONATA
     else:
@@ -134,16 +203,14 @@ with tab_materie:
 
         st.subheader(f"📚 {materia_scelta}")
 
-        # Opzione per eliminare l'intera materia sempre accessibile
         with st.expander("🗑️ Gestisci materia"):
-            st.caption(f"Rimuove definitivamente '{materia_scelta}' e tutti i suoi quiz (sia da fare che completati).")
-            if st.button("Elimina intera materia", type="primary", key=f"del_mat_{materia_scelta}"):
-                supabase.table("quiz").delete().eq("materia", materia_scelta).execute()
+            st.caption(f"Rimuove definitivamente '{materia_scelta}' e tutti i suoi quiz da questo profilo.")
+            if st.button("Elimina intera materia", type="primary", key=f"del_mat_{profilo_attivo}_{materia_scelta}"):
+                supabase.table("quiz").delete().eq("materia", materia_scelta).eq("proprietario", profilo_attivo).execute()
                 st.session_state["materia_selezionata"] = None
                 st.toast(f"Materia '{materia_scelta}' eliminata!")
                 st.rerun()
 
-        # Separa i quiz della materia in Da Fare e Completati
         quiz_mat_da_fare = [q for q in tutti_i_quiz if q["materia"] == materia_scelta and not q.get("completato")]
         quiz_mat_completati = [q for q in tutti_i_quiz if q["materia"] == materia_scelta and q.get("completato")]
 
@@ -152,15 +219,13 @@ with tab_materie:
             f"✅ Completati ({len(quiz_mat_completati)})"
         ])
 
-        # ------------------------------------------
-        # SOTTO-SCHEDA 1: QUIZ DA FARE
-        # ------------------------------------------
+        # SOTTO-SCHEDA 1: DA FARE
         with sub_da_fare:
             if not quiz_mat_da_fare:
                 st.info("Hai completato tutti i quiz di questa materia! Puoi rivederli in '✅ Completati' o crearne di nuovi.")
             else:
                 titoli = {f"{q['titolo']} (#{q['id']})": q for q in quiz_mat_da_fare}
-                titolo_scelto = st.selectbox("Scegli il quiz:", list(titoli.keys()), key=f"tit_da_fare_{materia_scelta}")
+                titolo_scelto = st.selectbox("Scegli il quiz:", list(titoli.keys()), key=f"tit_da_fare_{profilo_attivo}_{materia_scelta}")
 
                 quiz_attivo = titoli[titolo_scelto]
                 quiz_id = quiz_attivo["id"]
@@ -173,7 +238,6 @@ with tab_materie:
                         st.toast("Quiz eliminato!")
                         st.rerun()
 
-                # Scelta modalità: Allenamento vs Esame
                 modalita = st.radio(
                     "Modalità di svolgimento:",
                     ["🏋️ Allenamento", "🎓 Esame con Timer"],
@@ -183,7 +247,7 @@ with tab_materie:
 
                 st.divider()
 
-                # MODALITÀ A: ALLENAMENTO
+                # MODALITÀ ALLENAMENTO
                 if modalita == "🏋️ Allenamento":
                     risposte_date_pre = sum(
                         1 for i in range(len(domande))
@@ -229,7 +293,7 @@ with tab_materie:
                             st.toast("Quiz archiviato in Completati!")
                             st.rerun()
 
-                # MODALITÀ B: ESAME CON TIMER E CONSEGNA AUTOMATICA
+                # MODALITÀ ESAME CON TIMER
                 else:
                     chiave_avviato = f"esame_avviato_{quiz_id}"
                     chiave_fine = f"esame_fine_{quiz_id}"
@@ -337,9 +401,7 @@ with tab_materie:
                             else:
                                 st.error(f"Hai risposto: *{scelta}*. Risposta corretta: **{d['risposta_corretta']}**\n\n{d['spiegazione']}")
 
-        # ------------------------------------------
-        # SOTTO-SCHEDA 2: QUIZ COMPLETATI DELLA MATERIA
-        # ------------------------------------------
+        # SOTTO-SCHEDA 2: COMPLETATI
         with sub_completati:
             if not quiz_mat_completati:
                 st.info("Non hai ancora completato nessun quiz di questa materia.")
@@ -385,15 +447,14 @@ with tab_materie:
 # SCHEDA 2: CREA E SALVA UN NUOVO QUIZ
 # ==========================================
 with tab_crea:
-    st.subheader("Genera un quiz con Gemini")
+    st.subheader(f"Genera un quiz con Gemini (profilo: {profilo_attivo})")
 
-    # Menu smart per la materia
     materie_esistenti = sorted(list(set(q["materia"] for q in tutti_i_quiz)))
     if materie_esistenti:
         scelta_mat = st.selectbox(
             "Materia:",
             materie_esistenti + ["➕ Nuova materia..."],
-            key="smart_mat_select"
+            key=f"smart_mat_select_{profilo_attivo}"
         )
         if scelta_mat == "➕ Nuova materia...":
             materia = st.text_input("Nome della nuova materia (es. Diritto Privato, Biologia, Storia)")
@@ -417,7 +478,6 @@ with tab_crea:
         else:
             with st.spinner("Gemini sta leggendo gli appunti e preparando le domande..."):
                 try:
-                    # Carica il file temporaneamente su Gemini
                     uploaded_file = client_gemini.files.upload(
                         file=file_appunti,
                         config={"mime_type": file_appunti.type}
@@ -433,7 +493,6 @@ with tab_crea:
                     if esempi_quiz:
                         prompt += f"\nSegui rigorosamente lo stile, il tono e la difficoltà di questi esempi:\n{esempi_quiz}"
 
-                    # Generazione con cambio automatico di modello in caso di 503 o 429
                     modelli_disponibili = [
                         "gemini-4-hydrogen",
                         "gemini-3.5-flash-lite",
@@ -467,15 +526,62 @@ with tab_crea:
 
                     quiz_pronto = QuizGenerato.model_validate_json(response.text)
 
-                    # Salva il quiz nel database Supabase
                     dati_da_salvare = {
                         "materia": materia.strip(),
                         "titolo": titolo.strip(),
                         "domande": [d.model_dump() for d in quiz_pronto.domande],
-                        "completato": False
+                        "completato": False,
+                        "proprietario": profilo_attivo
                     }
                     supabase.table("quiz").insert(dati_da_salvare).execute()
 
                     st.success(f"Quiz '{titolo}' salvato in '{materia}'! Aprila da '📚 Le Mie Materie' per provarlo.")
                 except Exception as e:
                     st.error(f"Si è verificato un errore: {e}")
+
+# ==========================================
+# SCHEDA 3: GESTIONE UTENTI (SOLO ADMIN)
+# ==========================================
+if tab_utenti is not None:
+    with tab_utenti:
+        st.subheader("➕ Crea un nuovo profilo")
+        nuovo_user = st.text_input("Username del nuovo utente (es. marco):", key="new_u_name").strip().lower()
+        nuova_pass = st.text_input("Password per questo utente:", type="password", key="new_u_pass")
+
+        if st.button("Crea Utente", type="primary", use_container_width=True):
+            if not nuovo_user or not nuova_pass:
+                st.warning("Inserisci sia lo username che la password.")
+            elif nuovo_user == "admin":
+                st.error("Lo username 'admin' è riservato.")
+            elif nuovo_user in tutti_gli_utenti:
+                st.error(f"Esiste già un utente chiamato '{nuovo_user}'.")
+            else:
+                supabase.table("utenti").insert({
+                    "username": nuovo_user,
+                    "password_hash": cifra_password(nuova_pass)
+                }).execute()
+                st.success(f"Utente '{nuovo_user}' creato! Ora può accedere con la sua password.")
+                st.rerun()
+
+        st.divider()
+        st.subheader("👥 Utenti esistenti")
+        if not tutti_gli_utenti:
+            st.info("Non hai ancora creato nessun altro utente.")
+        else:
+            for u in tutti_gli_utenti:
+                col_u1, col_u2, col_u3 = st.columns([2, 1, 1])
+                with col_u1:
+                    st.markdown(f"👤 **{u}**")
+                with col_u2:
+                    if st.button("👁️ Entra", key=f"entra_{u}", use_container_width=True):
+                        st.session_state["profilo_attivo"] = u
+                        st.session_state["materia_selezionata"] = None
+                        st.rerun()
+                with col_u3:
+                    if st.button("🗑️ Elimina", key=f"elimina_u_{u}", use_container_width=True):
+                        supabase.table("quiz").delete().eq("proprietario", u).execute()
+                        supabase.table("utenti").delete().eq("username", u).execute()
+                        if st.session_state["profilo_attivo"] == u:
+                            st.session_state["profilo_attivo"] = "admin"
+                        st.toast(f"Utente '{u}' e tutti i suoi quiz eliminati!")
+                        st.rerun()
