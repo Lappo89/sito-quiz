@@ -3,11 +3,16 @@ import hashlib
 import time
 from datetime import datetime
 import fitz  # PyMuPDF per testo rapido e ritaglio intelligente dai PDF
+import schemdraw
+import schemdraw.elements as elm
 import streamlit as st
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
 from supabase import create_client
+
+# Usa il motore SVG integrato di schemdraw (veloce e senza bisogno di matplotlib)
+schemdraw.use("svg")
 
 # Impostazione ottimizzata per smartphone
 st.set_page_config(page_title="I Miei Quiz", page_icon="🧠", layout="centered")
@@ -65,8 +70,32 @@ def estrai_ritaglio_pdf(pdf_bytes: bytes, pagina: int | None, box: list[int] | N
     except Exception:
         return None
 
+def renderizza_schemdraw(codice_py: str | None) -> str | None:
+    """Esegue il codice schemdraw generato da Gemini e restituisce l'SVG pulito."""
+    if not codice_py or not codice_py.strip():
+        return None
+    try:
+        # Pulisce eventuali blocchi markdown ```python ... ```
+        codice = codice_py.strip()
+        if codice.startswith("```"):
+            righe = codice.splitlines()
+            codice = "\n".join(r for r in righe if not r.strip().startswith("```"))
+
+        d = schemdraw.Drawing(show=False)
+        ambiente_sicuro = {
+            "__builtins__": {"range": range, "len": len, "abs": abs, "min": min, "max": max},
+            "d": d,
+            "elm": elm,
+            "schemdraw": schemdraw,
+        }
+        exec(codice, ambiente_sicuro)
+        svg_bytes = d.get_imagedata("svg")
+        return svg_bytes.decode("utf-8")
+    except Exception:
+        return None
+
 def mostra_testo_e_immagine(indice: int, item: dict, chiave_testo: str = "testo"):
-    """Mostra il testo (domanda o traccia esercizio) e, se presente, l'immagine o lo schema SVG di fianco."""
+    """Mostra il testo (domanda o traccia esercizio) e, se presente, l'immagine o lo schema di fianco."""
     img_b64 = item.get("immagine_b64")
     svg_code = item.get("svg_code")
     testo = item.get(chiave_testo, "")
@@ -77,7 +106,7 @@ def mostra_testo_e_immagine(indice: int, item: dict, chiave_testo: str = "testo"
             st.markdown(f"**{indice}. {testo}**")
         with col_img:
             st.markdown(
-                f'<div style="background-color: #ffffff; padding: 10px; border-radius: 8px; text-align: center;">{svg_code}</div>',
+                f'<div style="background-color: #ffffff; padding: 10px; border-radius: 8px; text-align: center; overflow-x: auto;">{svg_code}</div>',
                 unsafe_allow_html=True
             )
     elif img_b64:
@@ -190,15 +219,15 @@ class EsercizioSemplice(BaseModel):
 class SchedaEserciziSemplice(BaseModel):
     esercizi: list[EsercizioSemplice]
 
-class EsercizioConSVG(BaseModel):
+class EsercizioConSchemdraw(BaseModel):
     traccia: str
     suggerimento: str
     svolgimento: str
     risultato_finale: str
-    svg_code: str | None = None
+    schemdraw_code: str | None = None
 
-class SchedaEserciziConSVG(BaseModel):
-    esercizi: list[EsercizioConSVG]
+class SchedaEserciziConSchemdraw(BaseModel):
+    esercizi: list[EsercizioConSchemdraw]
 
 class EsercizioConImmagine(BaseModel):
     traccia: str
@@ -226,7 +255,7 @@ def mostra_timer_esame(quiz_id, fine_timestamp):
         else:
             st.info(f"⏱️ Tempo rimanente: **{minuti:02d}:{secondi:02d}**")
 
-# Calcolo media punteggi (ignora gli esercizi marcati come "Svolto")
+# Calcolo media punteggi
 def calcola_media_percentuale(lista_quiz):
     percentuali = []
     for q in lista_quiz:
@@ -794,7 +823,7 @@ with tab_crea_es:
         "Gestione immagini / schemi per i nuovi esercizi:",
         [
             "⚡ Nessuna immagine (veloce)",
-            "🎨 Disegna nuovi schemi (SVG)",
+            "🔌 Disegna nuovi circuiti (Schemdraw)",
             "✂️ Ritaglia dal PDF originale"
         ],
         index=1,
@@ -813,8 +842,8 @@ with tab_crea_es:
             st.warning("Compila materia, titolo e carica un file o una foto con gli esercizi di partenza.")
         else:
             msg_spinner = (
-                "Gemini sta creando nuovi esercizi e disegnando gli schemi su misura..."
-                if modalita_img_es == "🎨 Disegna nuovi schemi (SVG)"
+                "Gemini sta creando nuovi esercizi e disegnando i circuiti con Schemdraw..."
+                if modalita_img_es == "🔌 Disegna nuovi circuiti (Schemdraw)"
                 else "Gemini sta creando nuovi esercizi simili con svolgimento..."
             )
             with st.spinner(msg_spinner):
@@ -832,17 +861,18 @@ with tab_crea_es:
                     - `risultato_finale`: il risultato finale sintetico.
                     """
 
-                    usa_svg = modalita_img_es == "🎨 Disegna nuovi schemi (SVG)"
+                    usa_schemdraw = modalita_img_es == "🔌 Disegna nuovi circuiti (Schemdraw)"
                     usa_ritaglio = modalita_img_es == "✂️ Ritaglia dal PDF originale" and e_pdf
 
-                    if usa_svg:
+                    if usa_schemdraw:
                         prompt += """
-                        DISEGNO NUOVI SCHEMI IN SVG:
-                        - Se gli esercizi di partenza hanno figure, circuiti, grafici, travi, sistemi meccanici 2D (molle, carrucole, vincoli, forze) o schemi geometrici, genera nel campo `svg_code` un codice SVG pulito, valido e autocontenuto per il NUOVO esercizio.
-                        - Usa `viewBox="0 0 400 280"` e `style="width:100%; height:auto;"`.
-                        - Disegna con tratti neri/scuri nitidi (`stroke="#111"`, `stroke-width="2"`) e testo leggibile (`font-family="sans-serif"`, `font-size="13"`, `fill="#111"`).
-                        - Inserisci nel disegno i NUOVI valori/etichette coerenti con la nuova traccia (senza scrivere la soluzione!).
-                        - Se un esercizio non ha bisogno di alcuna figura, lascia `svg_code` a null.
+                        DISEGNO CIRCUITI CON SCHEMDRAW (Python):
+                        - Se l'esercizio coinvolge un circuito elettrico/elettronico, scrivi nel campo `schemdraw_code` SOLO il codice Python che aggiunge i componenti all'oggetto `d` (già inizializzato come `d = schemdraw.Drawing(show=False)`) usando `elm` (già importato come `import schemdraw.elements as elm`).
+                        - NON scrivere `import`, NON scrivere `with schemdraw.Drawing()` e NON chiamare `d.draw()` o `d.save()`.
+                        - Usa elementi standard reali di schemdraw: `elm.Resistor()`, `elm.Capacitor()`, `elm.Inductor()`, `elm.SourceV()`, `elm.Ground()`, `elm.Opamp()`, `elm.Line()`, `elm.Dot()`, `elm.Arrow()`, `elm.Ic()`.
+                        - Usa `.right()`, `.left()`, `.up()`, `.down()`, `.at(...)`, `.to(...)`, `d.push()`, `d.pop()` per collegare correttamente tutti i nodi senza componenti scollegati o sovrapposti.
+                        - Metti etichette chiare con `.label('R1')`, `.label('VR')`, ecc. coerenti con la nuova traccia.
+                        - Se l'esercizio non è un circuito, lascia `schemdraw_code` a null.
                         """
                     elif usa_ritaglio:
                         prompt += """
@@ -855,8 +885,7 @@ with tab_crea_es:
                     if prompt_es:
                         prompt += f"\nSegui attentamente queste istruzioni specifiche dell'utente:\n{prompt_es}"
 
-                    # Scelta contenuto da inviare a Gemini
-                    if e_img or usa_svg or usa_ritaglio:
+                    if e_img or usa_schemdraw or usa_ritaglio:
                         uploaded_file = client_gemini.files.upload(
                             file=file_esercizi,
                             config={"mime_type": file_esercizi.type}
@@ -877,8 +906,8 @@ with tab_crea_es:
                             )
                             contenuto_gemini = [uploaded_file, prompt]
 
-                    if usa_svg:
-                        schema_risposta = SchedaEserciziConSVG
+                    if usa_schemdraw:
+                        schema_risposta = SchedaEserciziConSchemdraw
                     elif usa_ritaglio:
                         schema_risposta = SchedaEserciziConImmagini
                     else:
@@ -896,9 +925,11 @@ with tab_crea_es:
                             "svolgimento": es.svolgimento,
                             "risultato_finale": es.risultato_finale,
                         }
-                        if usa_svg and es.svg_code and "<svg" in es.svg_code:
-                            es_dict["svg_code"] = es.svg_code.strip()
-                            immagini_trovate += 1
+                        if usa_schemdraw and es.schemdraw_code:
+                            svg_renderizzato = renderizza_schemdraw(es.schemdraw_code)
+                            if svg_renderizzato:
+                                es_dict["svg_code"] = svg_renderizzato
+                                immagini_trovate += 1
                         elif usa_ritaglio and es.pagina_immagine and es.box_immagine:
                             img_b64 = estrai_ritaglio_pdf(pdf_bytes, es.pagina_immagine, es.box_immagine)
                             if img_b64:
