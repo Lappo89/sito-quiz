@@ -19,6 +19,11 @@ supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 def cifra_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
+def e_scheda_esercizi(record: dict) -> bool:
+    """Riconosce automaticamente se un record salvato è una scheda di esercizi o un quiz."""
+    items = record.get("domande") or []
+    return len(items) > 0 and "traccia" in items[0]
+
 def estrai_testo_pdf(pdf_bytes: bytes) -> str:
     """Estrae velocemente il testo da un PDF per generazioni rapide senza immagini."""
     try:
@@ -60,17 +65,57 @@ def estrai_ritaglio_pdf(pdf_bytes: bytes, pagina: int | None, box: list[int] | N
     except Exception:
         return None
 
-def mostra_testo_e_immagine(indice: int, domanda: dict):
-    """Mostra il testo della domanda e, se presente, l'immagine ritagliata di fianco."""
-    img_b64 = domanda.get("immagine_b64")
-    if img_b64:
+def mostra_testo_e_immagine(indice: int, item: dict, chiave_testo: str = "testo"):
+    """Mostra il testo (domanda o traccia esercizio) e, se presente, l'immagine o lo schema SVG di fianco."""
+    img_b64 = item.get("immagine_b64")
+    svg_code = item.get("svg_code")
+    testo = item.get(chiave_testo, "")
+
+    if svg_code and "<svg" in svg_code:
         col_txt, col_img = st.columns([3, 2])
         with col_txt:
-            st.markdown(f"**{indice}. {domanda['testo']}**")
+            st.markdown(f"**{indice}. {testo}**")
+        with col_img:
+            st.markdown(
+                f'<div style="background-color: #ffffff; padding: 10px; border-radius: 8px; text-align: center;">{svg_code}</div>',
+                unsafe_allow_html=True
+            )
+    elif img_b64:
+        col_txt, col_img = st.columns([3, 2])
+        with col_txt:
+            st.markdown(f"**{indice}. {testo}**")
         with col_img:
             st.image(base64.b64decode(img_b64), use_container_width=True)
     else:
-        st.markdown(f"**{indice}. {domanda['testo']}**")
+        st.markdown(f"**{indice}. {testo}**")
+
+def genera_con_fallback(contenuto_gemini, schema_risposta):
+    """Chiama Gemini passando automaticamente al modello successivo in caso di 503 o 429."""
+    modelli_disponibili = [
+        "gemini-4-hydrogen",
+        "gemini-3.5-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3.8-flash",
+    ]
+    ultimo_errore = None
+    for nome_modello in modelli_disponibili:
+        try:
+            return client_gemini.models.generate_content(
+                model=nome_modello,
+                contents=contenuto_gemini,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=schema_risposta,
+                ),
+            )
+        except Exception as err:
+            ultimo_errore = err
+            if "503" in str(err) or "429" in str(err):
+                st.toast(f"{nome_modello} occupato, provo il prossimo modello...")
+                time.sleep(2)
+            else:
+                raise err
+    raise ultimo_errore
 
 # ==========================================
 # CONTROLLO LOGIN (ADMIN E UTENTI)
@@ -113,7 +158,9 @@ if not st.session_state["autenticato"]:
 if "materia_selezionata" not in st.session_state:
     st.session_state["materia_selezionata"] = None
 
-# Schemi Pydantic: uno veloce (solo testo) e uno con coordinate immagini
+# ==========================================
+# SCHEMI PYDANTIC (QUIZ ED ESERCIZI)
+# ==========================================
 class DomandaSemplice(BaseModel):
     testo: str
     opzioni: list[str]
@@ -134,6 +181,36 @@ class DomandaConImmagine(BaseModel):
 class QuizConImmagini(BaseModel):
     domande: list[DomandaConImmagine]
 
+class EsercizioSemplice(BaseModel):
+    traccia: str
+    suggerimento: str
+    svolgimento: str
+    risultato_finale: str
+
+class SchedaEserciziSemplice(BaseModel):
+    esercizi: list[EsercizioSemplice]
+
+class EsercizioConSVG(BaseModel):
+    traccia: str
+    suggerimento: str
+    svolgimento: str
+    risultato_finale: str
+    svg_code: str | None = None
+
+class SchedaEserciziConSVG(BaseModel):
+    esercizi: list[EsercizioConSVG]
+
+class EsercizioConImmagine(BaseModel):
+    traccia: str
+    suggerimento: str
+    svolgimento: str
+    risultato_finale: str
+    pagina_immagine: int | None = None
+    box_immagine: list[int] | None = None
+
+class SchedaEserciziConImmagini(BaseModel):
+    esercizi: list[EsercizioConImmagine]
+
 # Frammento live per il timer della modalità Esame
 @st.fragment(run_every=1)
 def mostra_timer_esame(quiz_id, fine_timestamp):
@@ -149,7 +226,7 @@ def mostra_timer_esame(quiz_id, fine_timestamp):
         else:
             st.info(f"⏱️ Tempo rimanente: **{minuti:02d}:{secondi:02d}**")
 
-# Calcolo media punteggi
+# Calcolo media punteggi (ignora gli esercizi marcati come "Svolto")
 def calcola_media_percentuale(lista_quiz):
     percentuali = []
     for q in lista_quiz:
@@ -202,7 +279,7 @@ else:
 
 profilo_attivo = st.session_state["profilo_attivo"]
 
-# Scarica SOLO i quiz del profilo attivo
+# Scarica SOLO i contenuti del profilo attivo
 risposta_db = (
     supabase.table("quiz")
     .select("*")
@@ -214,9 +291,18 @@ tutti_i_quiz = risposta_db.data or []
 
 # Schede principali
 if st.session_state["ruolo"] == "admin":
-    tab_materie, tab_crea, tab_utenti = st.tabs(["📚 Le Mie Materie", "➕ Crea Nuovo", "👑 Gestione Utenti"])
+    tab_materie, tab_crea_quiz, tab_crea_es, tab_utenti = st.tabs([
+        "📚 Le Mie Materie",
+        "➕ Crea Quiz",
+        "✍️ Crea Esercizi",
+        "👑 Gestione Utenti"
+    ])
 else:
-    tab_materie, tab_crea = st.tabs(["📚 Le Mie Materie", "➕ Crea Nuovo"])
+    tab_materie, tab_crea_quiz, tab_crea_es = st.tabs([
+        "📚 Le Mie Materie",
+        "➕ Crea Quiz",
+        "✍️ Crea Esercizi"
+    ])
     tab_utenti = None
 
 # ==========================================
@@ -267,25 +353,28 @@ with tab_materie:
         st.subheader(f"📚 {materia_scelta}")
 
         with st.expander("🗑️ Gestisci materia"):
-            st.caption(f"Rimuove definitivamente '{materia_scelta}' e tutti i suoi quiz da questo profilo.")
+            st.caption(f"Rimuove definitivamente '{materia_scelta}' e tutti i suoi quiz ed esercizi da questo profilo.")
             if st.button("Elimina intera materia", type="primary", key=f"del_mat_{profilo_attivo}_{materia_scelta}"):
                 supabase.table("quiz").delete().eq("materia", materia_scelta).eq("proprietario", profilo_attivo).execute()
                 st.session_state["materia_selezionata"] = None
                 st.toast(f"Materia '{materia_scelta}' eliminata!")
                 st.rerun()
 
-        quiz_mat_da_fare = [q for q in tutti_i_quiz if q["materia"] == materia_scelta and not q.get("completato")]
-        quiz_mat_completati = [q for q in tutti_i_quiz if q["materia"] == materia_scelta and q.get("completato")]
+        contenuti_mat = [q for q in tutti_i_quiz if q["materia"] == materia_scelta]
+        quiz_mat_da_fare = [q for q in contenuti_mat if not q.get("completato") and not e_scheda_esercizi(q)]
+        es_mat_da_fare = [q for q in contenuti_mat if not q.get("completato") and e_scheda_esercizi(q)]
+        mat_completati = [q for q in contenuti_mat if q.get("completato")]
 
-        sub_da_fare, sub_completati = st.tabs([
-            f"📝 Da Fare ({len(quiz_mat_da_fare)})",
-            f"✅ Completati ({len(quiz_mat_completati)})"
+        sub_quiz, sub_es, sub_completati = st.tabs([
+            f"📝 Quiz ({len(quiz_mat_da_fare)})",
+            f"✍️ Esercizi ({len(es_mat_da_fare)})",
+            f"✅ Completati ({len(mat_completati)})"
         ])
 
-        # SOTTO-SCHEDA 1: DA FARE
-        with sub_da_fare:
+        # SOTTO-SCHEDA 1: QUIZ DA FARE
+        with sub_quiz:
             if not quiz_mat_da_fare:
-                st.info("Hai completato tutti i quiz di questa materia! Puoi rivederli in '✅ Completati' o crearne di nuovi.")
+                st.info("Non ci sono quiz da fare in questa materia.")
             else:
                 titoli = {f"{q['titolo']} (#{q['id']})": q for q in quiz_mat_da_fare}
                 titolo_scelto = st.selectbox("Scegli il quiz:", list(titoli.keys()), key=f"tit_da_fare_{profilo_attivo}_{materia_scelta}")
@@ -325,7 +414,7 @@ with tab_materie:
                     risposte_date = 0
 
                     for i, d in enumerate(domande):
-                        mostra_testo_e_immagine(i + 1, d)
+                        mostra_testo_e_immagine(i + 1, d, "testo")
                         scelta = st.radio(
                             "Seleziona una risposta:",
                             d["opzioni"],
@@ -400,7 +489,7 @@ with tab_materie:
                         )
 
                         for i, d in enumerate(domande):
-                            mostra_testo_e_immagine(i + 1, d)
+                            mostra_testo_e_immagine(i + 1, d, "testo")
                             st.radio(
                                 "Seleziona una risposta:",
                                 d["opzioni"],
@@ -456,7 +545,7 @@ with tab_materie:
                         st.subheader("Correzione dettagliata")
                         for i, d in enumerate(domande):
                             scelta = st.session_state.get(f"esame_{quiz_id}_q_{i}")
-                            mostra_testo_e_immagine(i + 1, d)
+                            mostra_testo_e_immagine(i + 1, d, "testo")
                             if scelta is None:
                                 st.warning(f"Nessuna risposta data. Risposta corretta: **{d['risposta_corretta']}**\n\n{d['spiegazione']}")
                             elif scelta == d["risposta_corretta"]:
@@ -464,52 +553,98 @@ with tab_materie:
                             else:
                                 st.error(f"Hai risposto: *{scelta}*. Risposta corretta: **{d['risposta_corretta']}**\n\n{d['spiegazione']}")
 
-        # SOTTO-SCHEDA 2: COMPLETATI
-        with sub_completati:
-            if not quiz_mat_completati:
-                st.info("Non hai ancora completato nessun quiz di questa materia.")
+        # SOTTO-SCHEDA 2: ESERCIZI DA SVOLGERE
+        with sub_es:
+            if not es_mat_da_fare:
+                st.info("Non ci sono schede di esercizi da fare in questa materia. Creane una da '✍️ Crea Esercizi'!")
             else:
-                media_perc = calcola_media_percentuale(quiz_mat_completati)
-                col_s1, col_s2 = st.columns(2)
-                with col_s1:
-                    st.metric("Quiz completati", len(quiz_mat_completati))
-                with col_s2:
-                    st.metric("Media punteggi", f"{media_perc:.1f}%" if media_perc is not None else "N/D")
+                titoli_es = {f"{q['titolo']} (#{q['id']})": q for q in es_mat_da_fare}
+                titolo_es_scelto = st.selectbox("Scegli la scheda esercizi:", list(titoli_es.keys()), key=f"tit_es_{profilo_attivo}_{materia_scelta}")
+
+                scheda_attiva = titoli_es[titolo_es_scelto]
+                scheda_id = scheda_attiva["id"]
+                lista_esercizi = scheda_attiva["domande"]
+
+                with st.expander("🗑️ Elimina questa scheda esercizi"):
+                    st.caption(f"Rimuove definitivamente '{scheda_attiva['titolo']}'.")
+                    if st.button("Conferma eliminazione", type="secondary", key=f"del_es_{scheda_id}"):
+                        supabase.table("quiz").delete().eq("id", scheda_id).execute()
+                        st.toast("Scheda esercizi eliminata!")
+                        st.rerun()
 
                 st.divider()
 
-                for q in quiz_mat_completati:
+                for i, es in enumerate(lista_esercizi):
+                    mostra_testo_e_immagine(i + 1, es, "traccia")
+                    with st.expander("💡 Mostra suggerimento"):
+                        st.info(es.get("suggerimento", "Nessun suggerimento disponibile."))
+                    with st.expander("📖 Mostra svolgimento e risultato"):
+                        st.markdown(es.get("svolgimento", ""))
+                        st.success(f"**Risultato finale:** {es.get('risultato_finale', '')}")
+                    st.write("")
+
+                if st.button("✅ Segna scheda come completata", type="primary", use_container_width=True, key=f"arch_es_{scheda_id}"):
+                    data_oggi = datetime.now().strftime("%d/%m/%Y %H:%M")
+                    supabase.table("quiz").update({
+                        "completato": True,
+                        "punteggio": "Svolto",
+                        "data_completamento": data_oggi
+                    }).eq("id", scheda_id).execute()
+                    st.toast("Scheda esercizi archiviata in Completati!")
+                    st.rerun()
+
+        # SOTTO-SCHEDA 3: COMPLETATI (QUIZ ED ESERCIZI)
+        with sub_completati:
+            if not mat_completati:
+                st.info("Non hai ancora completato nessun quiz o esercizio di questa materia.")
+            else:
+                media_perc = calcola_media_percentuale(mat_completati)
+                col_s1, col_s2 = st.columns(2)
+                with col_s1:
+                    st.metric("Completati", len(mat_completati))
+                with col_s2:
+                    st.metric("Media punteggi quiz", f"{media_perc:.1f}%" if media_perc is not None else "N/D")
+
+                st.divider()
+
+                for q in mat_completati:
                     punteggio_str = q.get("punteggio") or "N/D"
                     data_str = q.get("data_completamento") or "N/D"
-                    etichetta = f"✅ {q['titolo']} — Punteggio: {punteggio_str} | Data: {data_str}"
+                    icona = "✍️" if e_scheda_esercizi(q) else "✅"
+                    etichetta = f"{icona} {q['titolo']} — Esito: {punteggio_str} | Data: {data_str}"
 
                     with st.expander(etichetta):
                         col_a, col_b = st.columns(2)
                         with col_a:
-                            if st.button("🔄 Rifai questo quiz", key=f"rifai_{q['id']}", use_container_width=True):
+                            if st.button("🔄 Rifai", key=f"rifai_{q['id']}", use_container_width=True):
                                 supabase.table("quiz").update({
                                     "completato": False,
                                     "punteggio": None,
                                     "data_completamento": None
                                 }).eq("id", q["id"]).execute()
-                                st.toast("Quiz spostato di nuovo in 'Da Fare'!")
+                                st.toast("Spostato di nuovo in Da Fare!")
                                 st.rerun()
                         with col_b:
-                            if st.button("🗑️ Elimina definitivamente", key=f"del_comp_{q['id']}", use_container_width=True):
+                            if st.button("🗑️ Elimina", key=f"del_comp_{q['id']}", use_container_width=True):
                                 supabase.table("quiz").delete().eq("id", q["id"]).execute()
-                                st.toast("Quiz eliminato!")
+                                st.toast("Eliminato!")
                                 st.rerun()
 
                         st.divider()
-                        st.caption("Riepilogo domande e risposte corrette:")
-                        for idx, d in enumerate(q["domande"]):
-                            mostra_testo_e_immagine(idx + 1, d)
-                            st.markdown(f"👉 *{d['risposta_corretta']}* — {d['spiegazione']}")
+                        if e_scheda_esercizi(q):
+                            for idx, es in enumerate(q["domande"]):
+                                mostra_testo_e_immagine(idx + 1, es, "traccia")
+                                st.markdown(f"**Risultato:** {es.get('risultato_finale', '')}")
+                                st.caption(es.get("svolgimento", ""))
+                        else:
+                            for idx, d in enumerate(q["domande"]):
+                                mostra_testo_e_immagine(idx + 1, d, "testo")
+                                st.markdown(f"👉 *{d['risposta_corretta']}* — {d['spiegazione']}")
 
 # ==========================================
 # SCHEDA 2: CREA E SALVA UN NUOVO QUIZ
 # ==========================================
-with tab_crea:
+with tab_crea_quiz:
     st.subheader(f"Genera un quiz con Gemini (profilo: {profilo_attivo})")
 
     materie_esistenti = sorted(list(set(q["materia"] for q in tutti_i_quiz)))
@@ -517,26 +652,27 @@ with tab_crea:
         scelta_mat = st.selectbox(
             "Materia:",
             materie_esistenti + ["➕ Nuova materia..."],
-            key=f"smart_mat_select_{profilo_attivo}"
+            key=f"smart_mat_quiz_{profilo_attivo}"
         )
         if scelta_mat == "➕ Nuova materia...":
-            materia = st.text_input("Nome della nuova materia (es. Diritto Privato, Biologia, Storia)")
+            materia = st.text_input("Nome della nuova materia (es. Diritto Privato, Biologia, Storia)", key="new_mat_quiz")
         else:
             materia = scelta_mat
     else:
-        materia = st.text_input("Materia (es. Diritto Privato, Biologia, Storia)")
+        materia = st.text_input("Materia (es. Diritto Privato, Biologia, Storia)", key="first_mat_quiz")
 
-    titolo = st.text_input("Titolo del quiz (es. Capitolo 3 - I Contratti)")
-    file_appunti = st.file_uploader("Carica i tuoi appunti (PDF o TXT)", type=["pdf", "txt"])
-    includi_immagini = st.checkbox("🖼️ Estrai figure/grafici dal PDF (più lento)", value=False)
+    titolo = st.text_input("Titolo del quiz (es. Capitolo 3 - I Contratti)", key="tit_new_quiz")
+    file_appunti = st.file_uploader("Carica i tuoi appunti (PDF o TXT)", type=["pdf", "txt"], key="file_new_quiz")
+    includi_immagini = st.checkbox("🖼️ Estrai figure/grafici dal PDF (più lento)", value=False, key="img_new_quiz")
     istruzioni_extra = st.text_area(
         "Istruzioni personalizzate per Gemini (opzionale)",
-        placeholder="Es: Concentrati solo sul capitolo 2, fai domande difficili con casi pratici, insisti sulle formule..."
+        placeholder="Es: Concentrati solo sul capitolo 2, fai domande difficili con casi pratici, insisti sulle formule...",
+        key="prompt_new_quiz"
     )
-    esempi_quiz = st.text_area("Incolla 1 o 2 esempi di domande per far capire lo stile a Gemini (opzionale)")
-    num_domande = st.slider("Numero di domande", min_value=3, max_value=20, value=5)
+    esempi_quiz = st.text_area("Incolla 1 o 2 esempi di domande per far capire lo stile a Gemini (opzionale)", key="ex_new_quiz")
+    num_domande = st.slider("Numero di domande", min_value=3, max_value=20, value=5, key="num_new_quiz")
 
-    if st.button("Genera e Salva nel Sito", type="primary", use_container_width=True):
+    if st.button("Genera e Salva Quiz", type="primary", use_container_width=True):
         if not materia or not titolo or not file_appunti:
             st.warning("Compila materia, titolo e carica almeno un file di appunti.")
         else:
@@ -570,7 +706,6 @@ with tab_crea:
                     if esempi_quiz:
                         prompt += f"\nSegui rigorosamente lo stile, il tono e la difficoltà di questi esempi:\n{esempi_quiz}"
 
-                    # Percorso veloce (solo testo) vs percorso visivo (PDF completo)
                     if not usa_immagini:
                         testo_documento = (
                             estrai_testo_pdf(pdf_bytes)
@@ -580,7 +715,6 @@ with tab_crea:
                         if len(testo_documento) > 100:
                             contenuto_gemini = [f"DOCUMENTO:\n{testo_documento}\n\nISTRUZIONI:\n{prompt}"]
                         else:
-                            # Fallback per PDF scansionati senza testo selezionabile
                             uploaded_file = client_gemini.files.upload(
                                 file=file_appunti,
                                 config={"mime_type": file_appunti.type}
@@ -595,37 +729,7 @@ with tab_crea:
                         contenuto_gemini = [uploaded_file, prompt]
                         schema_risposta = QuizConImmagini
 
-                    modelli_disponibili = [
-                        "gemini-4-hydrogen",
-                        "gemini-3.5-flash-lite",
-                        "gemini-3.6-flash",
-                        "gemini-3.8-flash",
-                    ]
-                    response = None
-                    ultimo_errore = None
-
-                    for nome_modello in modelli_disponibili:
-                        try:
-                            response = client_gemini.models.generate_content(
-                                model=nome_modello,
-                                contents=contenuto_gemini,
-                                config=types.GenerateContentConfig(
-                                    response_mime_type="application/json",
-                                    response_schema=schema_risposta,
-                                ),
-                            )
-                            break
-                        except Exception as err:
-                            ultimo_errore = err
-                            if "503" in str(err) or "429" in str(err):
-                                st.toast(f"{nome_modello} occupato, provo il prossimo modello...")
-                                time.sleep(2)
-                            else:
-                                raise err
-
-                    if response is None:
-                        raise ultimo_errore
-
+                    response = genera_con_fallback(contenuto_gemini, schema_risposta)
                     quiz_pronto = schema_risposta.model_validate_json(response.text)
 
                     domande_salvate = []
@@ -654,12 +758,170 @@ with tab_crea:
                     supabase.table("quiz").insert(dati_da_salvare).execute()
 
                     msg_img = f" (con {immagini_trovate} figure ritagliate)" if immagini_trovate > 0 else ""
-                    st.success(f"Quiz '{titolo}' salvato in '{materia}'{msg_img}! Aprila da '📚 Le Mie Materie' per provarlo.")
+                    st.success(f"Quiz '{titolo}' salvato in '{materia}'{msg_img}! Aprila da '📚 Le Mie Materie'.")
                 except Exception as e:
                     st.error(f"Si è verificato un errore: {e}")
 
 # ==========================================
-# SCHEDA 3: GESTIONE UTENTI (SOLO ADMIN)
+# SCHEDA 3: CREA NUOVI ESERCIZI SIMILI
+# ==========================================
+with tab_crea_es:
+    st.subheader(f"Genera nuovi esercizi simili (profilo: {profilo_attivo})")
+    st.caption("Carica esercizi svolti, temi d'esame o foto di esercizi: Gemini ne creerà di nuovi e diversi per farti allenare.")
+
+    materie_esistenti = sorted(list(set(q["materia"] for q in tutti_i_quiz)))
+    if materie_esistenti:
+        scelta_mat_es = st.selectbox(
+            "Materia:",
+            materie_esistenti + ["➕ Nuova materia..."],
+            key=f"smart_mat_es_{profilo_attivo}"
+        )
+        if scelta_mat_es == "➕ Nuova materia...":
+            materia_es = st.text_input("Nome della nuova materia (es. Fisica, Analisi 1, Elettrotecnica)", key="new_mat_es")
+        else:
+            materia_es = scelta_mat_es
+    else:
+        materia_es = st.text_input("Materia (es. Fisica, Analisi 1, Elettrotecnica)", key="first_mat_es")
+
+    titolo_es = st.text_input("Titolo della scheda esercizi (es. Esercizi sui Circuiti RC)", key="tit_new_es")
+    file_esercizi = st.file_uploader(
+        "Carica gli esercizi di partenza (PDF, TXT o Foto PNG/JPG)",
+        type=["pdf", "txt", "png", "jpg", "jpeg"],
+        key="file_new_es"
+    )
+
+    modalita_img_es = st.radio(
+        "Gestione immagini / schemi per i nuovi esercizi:",
+        [
+            "⚡ Nessuna immagine (veloce)",
+            "🎨 Disegna nuovi schemi (SVG)",
+            "✂️ Ritaglia dal PDF originale"
+        ],
+        index=1,
+        key="mod_img_es"
+    )
+
+    prompt_es = st.text_area(
+        "Prompt / Istruzioni personalizzate per Gemini (opzionale)",
+        placeholder="Es: Crea esercizi dello stesso tipo ma cambia tutti i valori numerici, rendili leggermente più difficili, concentrati sull'esercizio 3...",
+        key="prompt_new_es"
+    )
+    num_esercizi = st.slider("Numero di nuovi esercizi da generare", min_value=1, max_value=10, value=3, key="num_new_es")
+
+    if st.button("Genera e Salva Esercizi", type="primary", use_container_width=True):
+        if not materia_es or not titolo_es or not file_esercizi:
+            st.warning("Compila materia, titolo e carica un file o una foto con gli esercizi di partenza.")
+        else:
+            msg_spinner = (
+                "Gemini sta creando nuovi esercizi e disegnando gli schemi su misura..."
+                if modalita_img_es == "🎨 Disegna nuovi schemi (SVG)"
+                else "Gemini sta creando nuovi esercizi simili con svolgimento..."
+            )
+            with st.spinner(msg_spinner):
+                try:
+                    e_pdf = file_esercizi.type == "application/pdf"
+                    e_img = file_esercizi.type.startswith("image/")
+                    pdf_bytes = file_esercizi.getvalue() if e_pdf else None
+
+                    prompt = f"""
+                    Analizza gli esercizi presenti nel documento/immagine allegato e genera {num_esercizi} NUOVI esercizi simili per struttura, argomento e difficoltà, ma DIFFERENTI (cambia dati numerici, parametri, collegamenti, funzioni o scenari; non copiare gli originali).
+                    Per ogni nuovo esercizio fornisci:
+                    - `traccia`: il testo completo e chiaro del nuovo esercizio (usa notazione chiara per eventuali formule).
+                    - `suggerimento`: un breve indizio sul metodo o formula da usare, senza svelare il risultato.
+                    - `svolgimento`: la risoluzione completa passo-passo, chiara e ordinata.
+                    - `risultato_finale`: il risultato finale sintetico.
+                    """
+
+                    usa_svg = modalita_img_es == "🎨 Disegna nuovi schemi (SVG)"
+                    usa_ritaglio = modalita_img_es == "✂️ Ritaglia dal PDF originale" and e_pdf
+
+                    if usa_svg:
+                        prompt += """
+                        DISEGNO NUOVI SCHEMI IN SVG:
+                        - Se gli esercizi di partenza hanno figure, circuiti, grafici, travi, sistemi meccanici 2D (molle, carrucole, vincoli, forze) o schemi geometrici, genera nel campo `svg_code` un codice SVG pulito, valido e autocontenuto per il NUOVO esercizio.
+                        - Usa `viewBox="0 0 400 280"` e `style="width:100%; height:auto;"`.
+                        - Disegna con tratti neri/scuri nitidi (`stroke="#111"`, `stroke-width="2"`) e testo leggibile (`font-family="sans-serif"`, `font-size="13"`, `fill="#111"`).
+                        - Inserisci nel disegno i NUOVI valori/etichette coerenti con la nuova traccia (senza scrivere la soluzione!).
+                        - Se un esercizio non ha bisogno di alcuna figura, lascia `svg_code` a null.
+                        """
+                    elif usa_ritaglio:
+                        prompt += """
+                        IMMAGINI E SCHEMI DI RIFERIMENTO DAL PDF:
+                        - Se un nuovo esercizio si appoggia a uno schema/disegno presente nel PDF originale, compila `pagina_immagine` (da 1) e `box_immagine` come [ymin, xmin, ymax, xmax] su scala 0-1000.
+                        - Ritaglia SOLO la figura/schema escludendo testo e soluzioni originali.
+                        - Se non serve alcuna figura, lascia `pagina_immagine` e `box_immagine` a null.
+                        """
+
+                    if prompt_es:
+                        prompt += f"\nSegui attentamente queste istruzioni specifiche dell'utente:\n{prompt_es}"
+
+                    # Scelta contenuto da inviare a Gemini
+                    if e_img or usa_svg or usa_ritaglio:
+                        uploaded_file = client_gemini.files.upload(
+                            file=file_esercizi,
+                            config={"mime_type": file_esercizi.type}
+                        )
+                        contenuto_gemini = [uploaded_file, prompt]
+                    else:
+                        testo_doc = (
+                            estrai_testo_pdf(pdf_bytes)
+                            if e_pdf
+                            else file_esercizi.getvalue().decode("utf-8", errors="ignore").strip()
+                        )
+                        if len(testo_doc) > 100:
+                            contenuto_gemini = [f"ESERCIZI DI PARTENZA:\n{testo_doc}\n\nISTRUZIONI:\n{prompt}"]
+                        else:
+                            uploaded_file = client_gemini.files.upload(
+                                file=file_esercizi,
+                                config={"mime_type": file_esercizi.type}
+                            )
+                            contenuto_gemini = [uploaded_file, prompt]
+
+                    if usa_svg:
+                        schema_risposta = SchedaEserciziConSVG
+                    elif usa_ritaglio:
+                        schema_risposta = SchedaEserciziConImmagini
+                    else:
+                        schema_risposta = SchedaEserciziSemplice
+
+                    response = genera_con_fallback(contenuto_gemini, schema_risposta)
+                    scheda_pronta = schema_risposta.model_validate_json(response.text)
+
+                    esercizi_salvati = []
+                    immagini_trovate = 0
+                    for es in scheda_pronta.esercizi:
+                        es_dict = {
+                            "traccia": es.traccia,
+                            "suggerimento": es.suggerimento,
+                            "svolgimento": es.svolgimento,
+                            "risultato_finale": es.risultato_finale,
+                        }
+                        if usa_svg and es.svg_code and "<svg" in es.svg_code:
+                            es_dict["svg_code"] = es.svg_code.strip()
+                            immagini_trovate += 1
+                        elif usa_ritaglio and es.pagina_immagine and es.box_immagine:
+                            img_b64 = estrai_ritaglio_pdf(pdf_bytes, es.pagina_immagine, es.box_immagine)
+                            if img_b64:
+                                es_dict["immagine_b64"] = img_b64
+                                immagini_trovate += 1
+                        esercizi_salvati.append(es_dict)
+
+                    dati_da_salvare = {
+                        "materia": materia_es.strip(),
+                        "titolo": titolo_es.strip(),
+                        "domande": esercizi_salvati,
+                        "completato": False,
+                        "proprietario": profilo_attivo
+                    }
+                    supabase.table("quiz").insert(dati_da_salvare).execute()
+
+                    msg_img = f" (con {immagini_trovate} schemi inclusi)" if immagini_trovate > 0 else ""
+                    st.success(f"Scheda '{titolo_es}' salvata in '{materia_es}'{msg_img}! Aprila da '📚 Le Mie Materie' → '✍️ Esercizi'.")
+                except Exception as e:
+                    st.error(f"Si è verificato un errore: {e}")
+
+# ==========================================
+# SCHEDA 4: GESTIONE UTENTI (SOLO ADMIN)
 # ==========================================
 if tab_utenti is not None:
     with tab_utenti:
