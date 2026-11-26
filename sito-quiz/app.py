@@ -44,6 +44,38 @@ class Domanda(BaseModel):
 class QuizGenerato(BaseModel):
     domande: list[Domanda]
 
+# Frammento live per il timer della modalità Esame (si aggiorna ogni secondo)
+@st.fragment(run_every=1)
+def mostra_timer_esame(quiz_id, fine_timestamp):
+    rimanenti = int(fine_timestamp - time.time())
+    if rimanenti <= 0:
+        st.session_state[f"esame_consegnato_{quiz_id}"] = True
+        st.session_state[f"esame_scaduto_{quiz_id}"] = True
+        st.rerun()
+    else:
+        minuti, secondi = divmod(rimanenti, 60)
+        if rimanenti <= 60:
+            st.error(f"⏱️ Tempo rimanente: **{minuti:02d}:{secondi:02d}**")
+        else:
+            st.info(f"⏱️ Tempo rimanente: **{minuti:02d}:{secondi:02d}**")
+
+# Funzione di supporto per calcolare la media dei punteggi (es. "4 / 5" -> 80%)
+def calcola_media_percentuale(lista_quiz):
+    percentuali = []
+    for q in lista_quiz:
+        p = q.get("punteggio")
+        if p and "/" in str(p):
+            try:
+                num, den = str(p).split("/")
+                num, den = float(num.strip()), float(den.strip())
+                if den > 0:
+                    percentuali.append((num / den) * 100)
+            except ValueError:
+                pass
+    if not percentuali:
+        return None
+    return sum(percentuali) / len(percentuali)
+
 st.title("🧠 I Miei Quiz")
 
 # Scarica tutti i quiz salvati nel database una volta sola
@@ -77,7 +109,6 @@ with tab_esercitati:
                 st.rerun()
 
             st.write("")
-            # Crea i quadrotti a coppie (2 per riga)
             for i in range(0, len(materie), 2):
                 cols = st.columns(2)
                 for j, col in enumerate(cols):
@@ -116,6 +147,7 @@ with tab_esercitati:
         titolo_scelto = st.selectbox("Scegli il quiz:", list(titoli.keys()), key="tit_da_fare")
 
         quiz_attivo = titoli[titolo_scelto]
+        quiz_id = quiz_attivo["id"]
         domande = quiz_attivo["domande"]
 
         # Menu a tendina per eliminare il singolo quiz o l'intera materia in sicurezza
@@ -125,8 +157,8 @@ with tab_esercitati:
             with col1:
                 st.markdown("**Elimina solo questo quiz**")
                 st.caption(f"Rimuove '{quiz_attivo['titolo']}'.")
-                if st.button("Elimina quiz", type="secondary", key=f"del_quiz_{quiz_attivo['id']}"):
-                    supabase.table("quiz").delete().eq("id", quiz_attivo["id"]).execute()
+                if st.button("Elimina quiz", type="secondary", key=f"del_quiz_{quiz_id}"):
+                    supabase.table("quiz").delete().eq("id", quiz_id).execute()
                     st.toast("Quiz eliminato!")
                     st.rerun()
 
@@ -139,46 +171,180 @@ with tab_esercitati:
                     st.toast(f"Materia '{materia_scelta}' eliminata!")
                     st.rerun()
 
+        # Scelta modalità: Allenamento vs Esame
+        modalita = st.radio(
+            "Modalità di svolgimento:",
+            ["🏋️ Allenamento", "🎓 Esame con Timer"],
+            horizontal=True,
+            key=f"mod_{quiz_id}"
+        )
+
         st.divider()
 
-        # Mostra le domande con correzione immediata
-        punteggio = 0
-        risposte_date = 0
-
-        for i, d in enumerate(domande):
-            st.markdown(f"**{i+1}. {d['testo']}**")
-            scelta = st.radio(
-                "Seleziona una risposta:",
-                d["opzioni"],
-                key=f"quiz_{quiz_attivo['id']}_q_{i}",
-                index=None,
-                label_visibility="collapsed"
+        # ------------------------------------------
+        # MODALITÀ A: ALLENAMENTO (correzione immediata)
+        # ------------------------------------------
+        if modalita == "🏋️ Allenamento":
+            # Calcola risposte già date per la barra di avanzamento
+            risposte_date_pre = sum(
+                1 for i in range(len(domande))
+                if st.session_state.get(f"quiz_{quiz_id}_q_{i}") is not None
             )
-            if scelta:
-                risposte_date += 1
-                if scelta == d["risposta_corretta"]:
-                    st.success(f"Esatto! {d['spiegazione']}")
-                    punteggio += 1
+            st.progress(
+                risposte_date_pre / len(domande),
+                text=f"Avanzamento: {risposte_date_pre} / {len(domande)} domande"
+            )
+
+            punteggio = 0
+            risposte_date = 0
+
+            for i, d in enumerate(domande):
+                st.markdown(f"**{i+1}. {d['testo']}**")
+                scelta = st.radio(
+                    "Seleziona una risposta:",
+                    d["opzioni"],
+                    key=f"quiz_{quiz_id}_q_{i}",
+                    index=None,
+                    label_visibility="collapsed"
+                )
+                if scelta:
+                    risposte_date += 1
+                    if scelta == d["risposta_corretta"]:
+                        st.success(f"Esatto! {d['spiegazione']}")
+                        punteggio += 1
+                    else:
+                        st.error(f"Sbagliato. Risposta corretta: **{d['risposta_corretta']}**\n\n{d['spiegazione']}")
+                st.write("")
+
+            if risposte_date == len(domande):
+                st.balloons()
+                st.info(f"🎯 Quiz completato! Punteggio finale: **{punteggio} / {len(domande)}**")
+
+                if st.button("✅ Salva e archivia in Completati", type="primary", use_container_width=True, key=f"archivia_{quiz_id}"):
+                    data_oggi = datetime.now().strftime("%d/%m/%Y %H:%M")
+                    supabase.table("quiz").update({
+                        "completato": True,
+                        "punteggio": f"{punteggio} / {len(domande)}",
+                        "data_completamento": data_oggi
+                    }).eq("id", quiz_id).execute()
+                    st.toast("Quiz archiviato nella cartella Completati!")
+                    st.rerun()
+
+        # ------------------------------------------
+        # MODALITÀ B: ESAME CON TIMER E CONSEGNA AUTOMATICA
+        # ------------------------------------------
+        else:
+            chiave_avviato = f"esame_avviato_{quiz_id}"
+            chiave_fine = f"esame_fine_{quiz_id}"
+            chiave_consegnato = f"esame_consegnato_{quiz_id}"
+            chiave_scaduto = f"esame_scaduto_{quiz_id}"
+
+            if chiave_avviato not in st.session_state:
+                st.session_state[chiave_avviato] = False
+            if chiave_consegnato not in st.session_state:
+                st.session_state[chiave_consegnato] = False
+            if chiave_scaduto not in st.session_state:
+                st.session_state[chiave_scaduto] = False
+
+            # FASE 1: Impostazione durata prima di iniziare
+            if not st.session_state[chiave_avviato]:
+                st.info("In modalità **Esame** non vedrai le correzioni fino alla consegna. Se il tempo scade, il quiz verrà consegnato automaticamente.")
+                durata_minuti = st.number_input(
+                    "Durata dell'esame (in minuti):",
+                    min_value=1,
+                    max_value=180,
+                    value=max(2, len(domande)),
+                    step=1,
+                    key=f"durata_{quiz_id}"
+                )
+                if st.button("▶️ Avvia Esame", type="primary", use_container_width=True, key=f"start_{quiz_id}"):
+                    st.session_state[chiave_avviato] = True
+                    st.session_state[chiave_consegnato] = False
+                    st.session_state[chiave_scaduto] = False
+                    st.session_state[chiave_fine] = time.time() + (durata_minuti * 60)
+                    st.rerun()
+
+            # FASE 2: Esame in corso
+            elif not st.session_state[chiave_consegnato]:
+                mostra_timer_esame(quiz_id, st.session_state[chiave_fine])
+
+                risposte_date_pre = sum(
+                    1 for i in range(len(domande))
+                    if st.session_state.get(f"esame_{quiz_id}_q_{i}") is not None
+                )
+                st.progress(
+                    risposte_date_pre / len(domande),
+                    text=f"Avanzamento: {risposte_date_pre} / {len(domande)} domande risposte"
+                )
+
+                for i, d in enumerate(domande):
+                    st.markdown(f"**{i+1}. {d['testo']}**")
+                    st.radio(
+                        "Seleziona una risposta:",
+                        d["opzioni"],
+                        key=f"esame_{quiz_id}_q_{i}",
+                        index=None,
+                        label_visibility="collapsed"
+                    )
+                    st.write("")
+
+                if st.button("📤 Consegna Esame", type="primary", use_container_width=True, key=f"submit_{quiz_id}"):
+                    st.session_state[chiave_consegnato] = True
+                    st.rerun()
+
+            # FASE 3: Esame consegnato (manualmente o per tempo scaduto)
+            else:
+                if st.session_state[chiave_scaduto]:
+                    st.warning("⏰ **Tempo scaduto!** L'esame è stato consegnato automaticamente.")
                 else:
-                    st.error(f"Sbagliato. Risposta corretta: **{d['risposta_corretta']}**\n\n{d['spiegazione']}")
-            st.write("")
+                    st.success("📤 **Esame consegnato!** Ecco il risultato:")
 
-        if risposte_date == len(domande):
-            st.balloons()
-            st.info(f"🎯 Quiz completato! Punteggio finale: **{punteggio} / {len(domande)}**")
+                punteggio = 0
+                for i, d in enumerate(domande):
+                    scelta = st.session_state.get(f"esame_{quiz_id}_q_{i}")
+                    if scelta == d["risposta_corretta"]:
+                        punteggio += 1
 
-            if st.button("✅ Salva e archivia in Completati", type="primary", use_container_width=True, key=f"archivia_{quiz_attivo['id']}"):
-                data_oggi = datetime.now().strftime("%d/%m/%Y %H:%M")
-                supabase.table("quiz").update({
-                    "completato": True,
-                    "punteggio": f"{punteggio} / {len(domande)}",
-                    "data_completamento": data_oggi
-                }).eq("id", quiz_attivo["id"]).execute()
-                st.toast("Quiz archiviato nella cartella Completati!")
-                st.rerun()
+                perc = int((punteggio / len(domande)) * 100)
+                st.info(f"🎯 Punteggio finale: **{punteggio} / {len(domande)}** ({perc}%)")
+
+                col_e1, col_e2 = st.columns(2)
+                with col_e1:
+                    if st.button("✅ Archivia in Completati", type="primary", use_container_width=True, key=f"arch_esame_{quiz_id}"):
+                        data_oggi = datetime.now().strftime("%d/%m/%Y %H:%M")
+                        supabase.table("quiz").update({
+                            "completato": True,
+                            "punteggio": f"{punteggio} / {len(domande)}",
+                            "data_completamento": data_oggi
+                        }).eq("id", quiz_id).execute()
+                        st.session_state[chiave_avviato] = False
+                        st.session_state[chiave_consegnato] = False
+                        st.session_state[chiave_scaduto] = False
+                        st.toast("Esame archiviato nella cartella Completati!")
+                        st.rerun()
+                with col_e2:
+                    if st.button("🔄 Ripeti Esame", use_container_width=True, key=f"ripeti_esame_{quiz_id}"):
+                        st.session_state[chiave_avviato] = False
+                        st.session_state[chiave_consegnato] = False
+                        st.session_state[chiave_scaduto] = False
+                        for i in range(len(domande)):
+                            st.session_state.pop(f"esame_{quiz_id}_q_{i}", None)
+                        st.rerun()
+
+                st.divider()
+                st.subheader("Correzione dettagliata")
+                for i, d in enumerate(domande):
+                    scelta = st.session_state.get(f"esame_{quiz_id}_q_{i}")
+                    st.markdown(f"**{i+1}. {d['testo']}**")
+                    if scelta is None:
+                        st.warning(f"Nessuna risposta data. Risposta corretta: **{d['risposta_corretta']}**\n\n{d['spiegazione']}")
+                    elif scelta == d["risposta_corretta"]:
+                        st.success(f"Esatto! ({scelta}) — {d['spiegazione']}")
+                    else:
+                        st.error(f"Hai risposto: *{scelta}*. Risposta corretta: **{d['risposta_corretta']}**\n\n{d['spiegazione']}")
 
 # ==========================================
-# SCHEDA 2: CARTELLA QUIZ COMPLETATI
+# SCHEDA 2: CARTELLA QUIZ COMPLETATI + STATISTICHE
 # ==========================================
 with tab_completati:
     if not quiz_completati:
@@ -191,6 +357,16 @@ with tab_completati:
             quiz_completati if filtro_mat == "Tutte le materie"
             else [q for q in quiz_completati if q["materia"] == filtro_mat]
         )
+
+        # Mini-statistiche dinamiche in base al filtro selezionato
+        media_perc = calcola_media_percentuale(lista_filtrata)
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            st.metric("Quiz completati", len(lista_filtrata))
+        with col_s2:
+            st.metric("Media punteggi", f"{media_perc:.1f}%" if media_perc is not None else "N/D")
+
+        st.divider()
 
         for q in lista_filtrata:
             punteggio_str = q.get("punteggio") or "N/D"
@@ -226,7 +402,21 @@ with tab_completati:
 with tab_crea:
     st.subheader("Genera un quiz con Gemini")
 
-    materia = st.text_input("Materia (es. Diritto Privato, Biologia, Storia)")
+    # Menu smart per la materia
+    materie_esistenti = sorted(list(set(q["materia"] for q in tutti_i_quiz)))
+    if materie_esistenti:
+        scelta_mat = st.selectbox(
+            "Materia:",
+            materie_esistenti + ["➕ Nuova materia..."],
+            key="smart_mat_select"
+        )
+        if scelta_mat == "➕ Nuova materia...":
+            materia = st.text_input("Nome della nuova materia (es. Diritto Privato, Biologia, Storia)")
+        else:
+            materia = scelta_mat
+    else:
+        materia = st.text_input("Materia (es. Diritto Privato, Biologia, Storia)")
+
     titolo = st.text_input("Titolo del quiz (es. Capitolo 3 - I Contratti)")
     file_appunti = st.file_uploader("Carica i tuoi appunti (PDF o TXT)", type=["pdf", "txt"])
     istruzioni_extra = st.text_area(
