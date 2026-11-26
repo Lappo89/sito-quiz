@@ -1,6 +1,8 @@
+import base64
 import hashlib
 import time
 from datetime import datetime
+import fitz  # PyMuPDF per il ritaglio intelligente dai PDF
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -16,6 +18,51 @@ supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 def cifra_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+def estrai_ritaglio_pdf(pdf_bytes: bytes, pagina: int | None, box: list[int] | None) -> str | None:
+    """Ritaglia solo il riquadro [ymin, xmin, ymax, xmax] (scala 0-1000) dalla pagina del PDF."""
+    if not pdf_bytes or not pagina or not box or len(box) != 4:
+        return None
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if pagina < 1 or pagina > len(doc):
+            doc.close()
+            return None
+
+        page = doc[pagina - 1]
+        w, h = page.rect.width, page.rect.height
+        ymin, xmin, ymax, xmax = box
+
+        # Converte le coordinate 0-1000 in punti PDF con piccolo margine di sicurezza
+        x0 = max(0.0, min(w, (xmin / 1000.0) * w))
+        y0 = max(0.0, min(h, (ymin / 1000.0) * h))
+        x1 = max(0.0, min(w, (xmax / 1000.0) * w))
+        y1 = max(0.0, min(h, (ymax / 1000.0) * h))
+
+        # Scarta riquadri invalidi o troppo piccoli
+        if (x1 - x0) < 25 or (y1 - y0) < 25:
+            doc.close()
+            return None
+
+        clip = fitz.Rect(x0, y0, x1, y1)
+        pix = page.get_pixmap(clip=clip, dpi=150)
+        img_bytes = pix.tobytes("jpeg", jpg_quality=80)
+        doc.close()
+        return base64.b64encode(img_bytes).decode("utf-8")
+    except Exception:
+        return None
+
+def mostra_testo_e_immagine(indice: int, domanda: dict):
+    """Mostra il testo della domanda e, se presente, l'immagine ritagliata di fianco."""
+    img_b64 = domanda.get("immagine_b64")
+    if img_b64:
+        col_txt, col_img = st.columns([3, 2])
+        with col_txt:
+            st.markdown(f"**{indice}. {domanda['testo']}**")
+        with col_img:
+            st.image(base64.b64decode(img_b64), use_container_width=True)
+    else:
+        st.markdown(f"**{indice}. {domanda['testo']}**")
 
 # ==========================================
 # CONTROLLO LOGIN (ADMIN E UTENTI)
@@ -44,7 +91,6 @@ if not st.session_state["autenticato"]:
             st.session_state["profilo_attivo"] = "admin"
             st.rerun()
         else:
-            # Controlla nella tabella utenti su Supabase
             res = supabase.table("utenti").select("*").eq("username", username_inserito).execute()
             if res.data and res.data[0]["password_hash"] == cifra_password(password_inserita):
                 st.session_state["autenticato"] = True
@@ -56,16 +102,17 @@ if not st.session_state["autenticato"]:
                 st.error("Username o password errati. Riprova.")
     st.stop()
 
-# Stato per ricordare quale materia (quadrotto) è stata aperta
 if "materia_selezionata" not in st.session_state:
     st.session_state["materia_selezionata"] = None
 
-# Struttura rigorosa del quiz per Gemini
+# Struttura rigorosa del quiz per Gemini (con supporto coordinate immagine)
 class Domanda(BaseModel):
     testo: str
     opzioni: list[str]
     risposta_corretta: str
     spiegazione: str
+    pagina_immagine: int | None = None
+    box_immagine: list[int] | None = None
 
 class QuizGenerato(BaseModel):
     domande: list[Domanda]
@@ -114,7 +161,6 @@ with col_h2:
         st.session_state.clear()
         st.rerun()
 
-# Se è Admin, carica la lista utenti e permette di entrare in qualsiasi profilo
 tutti_gli_utenti = []
 if st.session_state["ruolo"] == "admin":
     res_utenti = supabase.table("utenti").select("username").order("username").execute()
@@ -149,7 +195,7 @@ risposta_db = (
 )
 tutti_i_quiz = risposta_db.data or []
 
-# Schede principali (Admin ha anche Gestione Utenti)
+# Schede principali
 if st.session_state["ruolo"] == "admin":
     tab_materie, tab_crea, tab_utenti = st.tabs(["📚 Le Mie Materie", "➕ Crea Nuovo", "👑 Gestione Utenti"])
 else:
@@ -262,7 +308,7 @@ with tab_materie:
                     risposte_date = 0
 
                     for i, d in enumerate(domande):
-                        st.markdown(f"**{i+1}. {d['testo']}**")
+                        mostra_testo_e_immagine(i + 1, d)
                         scelta = st.radio(
                             "Seleziona una risposta:",
                             d["opzioni"],
@@ -337,7 +383,7 @@ with tab_materie:
                         )
 
                         for i, d in enumerate(domande):
-                            st.markdown(f"**{i+1}. {d['testo']}**")
+                            mostra_testo_e_immagine(i + 1, d)
                             st.radio(
                                 "Seleziona una risposta:",
                                 d["opzioni"],
@@ -393,7 +439,7 @@ with tab_materie:
                         st.subheader("Correzione dettagliata")
                         for i, d in enumerate(domande):
                             scelta = st.session_state.get(f"esame_{quiz_id}_q_{i}")
-                            st.markdown(f"**{i+1}. {d['testo']}**")
+                            mostra_testo_e_immagine(i + 1, d)
                             if scelta is None:
                                 st.warning(f"Nessuna risposta data. Risposta corretta: **{d['risposta_corretta']}**\n\n{d['spiegazione']}")
                             elif scelta == d["risposta_corretta"]:
@@ -440,7 +486,7 @@ with tab_materie:
                         st.divider()
                         st.caption("Riepilogo domande e risposte corrette:")
                         for idx, d in enumerate(q["domande"]):
-                            st.markdown(f"**{idx+1}. {d['testo']}**")
+                            mostra_testo_e_immagine(idx + 1, d)
                             st.markdown(f"👉 *{d['risposta_corretta']}* — {d['spiegazione']}")
 
 # ==========================================
@@ -476,8 +522,11 @@ with tab_crea:
         if not materia or not titolo or not file_appunti:
             st.warning("Compila materia, titolo e carica almeno un file di appunti.")
         else:
-            with st.spinner("Gemini sta leggendo gli appunti e preparando le domande..."):
+            with st.spinner("Gemini sta leggendo gli appunti e preparando le domande (e le eventuali figure)..."):
                 try:
+                    # Salva i byte del PDF prima dell'upload per poter ritagliare le immagini
+                    pdf_bytes = file_appunti.getvalue() if file_appunti.type == "application/pdf" else None
+
                     uploaded_file = client_gemini.files.upload(
                         file=file_appunti,
                         config={"mime_type": file_appunti.type}
@@ -487,6 +536,11 @@ with tab_crea:
                     Crea un quiz di {num_domande} domande a risposta multipla (4 opzioni ciascuna) basato SOLO sul documento allegato.
                     La risposta corretta deve corrispondere esattamente a una delle 4 opzioni.
                     Aggiungi una spiegazione chiara e sintetica per ogni domanda.
+
+                    IMMAGINI E FIGURE (solo se il documento è un PDF con figure/grafici/circuiti/schemi/tabelle utili alla domanda):
+                    - Se una domanda si riferisce a una figura, un grafico, un circuito o uno schema presente nel PDF, compila `pagina_immagine` (numero di pagina a partire da 1) e `box_immagine` come [ymin, xmin, ymax, xmax] su scala 0-1000.
+                    - Il riquadro `box_immagine` deve contenere SOLO la figura/grafico/schema, escludendo il testo circostante della slide che potrebbe rivelare la risposta.
+                    - Se la domanda non necessita di alcuna immagine, lascia `pagina_immagine` e `box_immagine` a null.
                     """
                     if istruzioni_extra:
                         prompt += f"\nSegui attentamente queste istruzioni specifiche dell'utente:\n{istruzioni_extra}"
@@ -526,16 +580,34 @@ with tab_crea:
 
                     quiz_pronto = QuizGenerato.model_validate_json(response.text)
 
+                    # Estrae e ritaglia eventuali immagini indicate da Gemini
+                    domande_salvate = []
+                    immagini_trovate = 0
+                    for d in quiz_pronto.domande:
+                        d_dict = {
+                            "testo": d.testo,
+                            "opzioni": d.opzioni,
+                            "risposta_corretta": d.risposta_corretta,
+                            "spiegazione": d.spiegazione,
+                        }
+                        if pdf_bytes and d.pagina_immagine and d.box_immagine:
+                            img_b64 = estrai_ritaglio_pdf(pdf_bytes, d.pagina_immagine, d.box_immagine)
+                            if img_b64:
+                                d_dict["immagine_b64"] = img_b64
+                                immagini_trovate += 1
+                        domande_salvate.append(d_dict)
+
                     dati_da_salvare = {
                         "materia": materia.strip(),
                         "titolo": titolo.strip(),
-                        "domande": [d.model_dump() for d in quiz_pronto.domande],
+                        "domande": domande_salvate,
                         "completato": False,
                         "proprietario": profilo_attivo
                     }
                     supabase.table("quiz").insert(dati_da_salvare).execute()
 
-                    st.success(f"Quiz '{titolo}' salvato in '{materia}'! Aprila da '📚 Le Mie Materie' per provarlo.")
+                    msg_img = f" (con {immagini_trovate} figure ritagliate)" if immagini_trovate > 0 else ""
+                    st.success(f"Quiz '{titolo}' salvato in '{materia}'{msg_img}! Aprila da '📚 Le Mie Materie' per provarlo.")
                 except Exception as e:
                     st.error(f"Si è verificato un errore: {e}")
 
