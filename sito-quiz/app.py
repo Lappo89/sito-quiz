@@ -188,6 +188,10 @@ with tab_crea:
     materia = st.text_input("Materia (es. Diritto Privato, Biologia, Storia)")
     titolo = st.text_input("Titolo del quiz (es. Capitolo 3 - I Contratti)")
     file_appunti = st.file_uploader("Carica i tuoi appunti (PDF o TXT)", type=["pdf", "txt"])
+    istruzioni_extra = st.text_area(
+        "Istruzioni personalizzate per Gemini (opzionale)",
+        placeholder="Es: Concentrati solo sul capitolo 2, fai domande difficili con casi pratici, insisti sulle formule..."
+    )
     esempi_quiz = st.text_area("Incolla 1 o 2 esempi di domande per far capire lo stile a Gemini (opzionale)")
     num_domande = st.slider("Numero di domande", min_value=3, max_value=20, value=5)
 
@@ -208,6 +212,8 @@ with tab_crea:
                     La risposta corretta deve corrispondere esattamente a una delle 4 opzioni.
                     Aggiungi una spiegazione chiara e sintetica per ogni domanda.
                     """
+                    if istruzioni_extra:
+                        prompt += f"\nSegui attentamente queste istruzioni specifiche dell'utente:\n{istruzioni_extra}"
                     if esempi_quiz:
                         prompt += f"\nSegui rigorosamente lo stile, il tono e la difficoltà di questi esempi:\n{esempi_quiz}"
 
