@@ -2,7 +2,7 @@ import base64
 import hashlib
 import time
 from datetime import datetime
-import fitz  # PyMuPDF per il ritaglio intelligente dai PDF
+import fitz  # PyMuPDF per testo rapido e ritaglio intelligente dai PDF
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -19,6 +19,16 @@ supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 def cifra_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
+def estrai_testo_pdf(pdf_bytes: bytes) -> str:
+    """Estrae velocemente il testo da un PDF per generazioni rapide senza immagini."""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        testo = "\n".join(page.get_text("text") for page in doc)
+        doc.close()
+        return testo.strip()
+    except Exception:
+        return ""
+
 def estrai_ritaglio_pdf(pdf_bytes: bytes, pagina: int | None, box: list[int] | None) -> str | None:
     """Ritaglia solo il riquadro [ymin, xmin, ymax, xmax] (scala 0-1000) dalla pagina del PDF."""
     if not pdf_bytes or not pagina or not box or len(box) != 4:
@@ -33,13 +43,11 @@ def estrai_ritaglio_pdf(pdf_bytes: bytes, pagina: int | None, box: list[int] | N
         w, h = page.rect.width, page.rect.height
         ymin, xmin, ymax, xmax = box
 
-        # Converte le coordinate 0-1000 in punti PDF con piccolo margine di sicurezza
         x0 = max(0.0, min(w, (xmin / 1000.0) * w))
         y0 = max(0.0, min(h, (ymin / 1000.0) * h))
         x1 = max(0.0, min(w, (xmax / 1000.0) * w))
         y1 = max(0.0, min(h, (ymax / 1000.0) * h))
 
-        # Scarta riquadri invalidi o troppo piccoli
         if (x1 - x0) < 25 or (y1 - y0) < 25:
             doc.close()
             return None
@@ -105,8 +113,17 @@ if not st.session_state["autenticato"]:
 if "materia_selezionata" not in st.session_state:
     st.session_state["materia_selezionata"] = None
 
-# Struttura rigorosa del quiz per Gemini (con supporto coordinate immagine)
-class Domanda(BaseModel):
+# Schemi Pydantic: uno veloce (solo testo) e uno con coordinate immagini
+class DomandaSemplice(BaseModel):
+    testo: str
+    opzioni: list[str]
+    risposta_corretta: str
+    spiegazione: str
+
+class QuizSemplice(BaseModel):
+    domande: list[DomandaSemplice]
+
+class DomandaConImmagine(BaseModel):
     testo: str
     opzioni: list[str]
     risposta_corretta: str
@@ -114,8 +131,8 @@ class Domanda(BaseModel):
     pagina_immagine: int | None = None
     box_immagine: list[int] | None = None
 
-class QuizGenerato(BaseModel):
-    domande: list[Domanda]
+class QuizConImmagini(BaseModel):
+    domande: list[DomandaConImmagine]
 
 # Frammento live per il timer della modalità Esame
 @st.fragment(run_every=1)
@@ -511,6 +528,7 @@ with tab_crea:
 
     titolo = st.text_input("Titolo del quiz (es. Capitolo 3 - I Contratti)")
     file_appunti = st.file_uploader("Carica i tuoi appunti (PDF o TXT)", type=["pdf", "txt"])
+    includi_immagini = st.checkbox("🖼️ Estrai figure/grafici dal PDF (più lento)", value=False)
     istruzioni_extra = st.text_area(
         "Istruzioni personalizzate per Gemini (opzionale)",
         placeholder="Es: Concentrati solo sul capitolo 2, fai domande difficili con casi pratici, insisti sulle formule..."
@@ -522,30 +540,60 @@ with tab_crea:
         if not materia or not titolo or not file_appunti:
             st.warning("Compila materia, titolo e carica almeno un file di appunti.")
         else:
-            with st.spinner("Gemini sta leggendo gli appunti e preparando le domande (e le eventuali figure)..."):
+            msg_spinner = (
+                "Gemini sta analizzando le pagine e ritagliando le figure..."
+                if includi_immagini
+                else "Gemini sta leggendo gli appunti e preparando le domande..."
+            )
+            with st.spinner(msg_spinner):
                 try:
-                    # Salva i byte del PDF prima dell'upload per poter ritagliare le immagini
-                    pdf_bytes = file_appunti.getvalue() if file_appunti.type == "application/pdf" else None
-
-                    uploaded_file = client_gemini.files.upload(
-                        file=file_appunti,
-                        config={"mime_type": file_appunti.type}
-                    )
+                    e_pdf = file_appunti.type == "application/pdf"
+                    pdf_bytes = file_appunti.getvalue() if e_pdf else None
 
                     prompt = f"""
                     Crea un quiz di {num_domande} domande a risposta multipla (4 opzioni ciascuna) basato SOLO sul documento allegato.
                     La risposta corretta deve corrispondere esattamente a una delle 4 opzioni.
                     Aggiungi una spiegazione chiara e sintetica per ogni domanda.
-
-                    IMMAGINI E FIGURE (solo se il documento è un PDF con figure/grafici/circuiti/schemi/tabelle utili alla domanda):
-                    - Se una domanda si riferisce a una figura, un grafico, un circuito o uno schema presente nel PDF, compila `pagina_immagine` (numero di pagina a partire da 1) e `box_immagine` come [ymin, xmin, ymax, xmax] su scala 0-1000.
-                    - Il riquadro `box_immagine` deve contenere SOLO la figura/grafico/schema, escludendo il testo circostante della slide che potrebbe rivelare la risposta.
-                    - Se la domanda non necessita di alcuna immagine, lascia `pagina_immagine` e `box_immagine` a null.
                     """
+
+                    usa_immagini = includi_immagini and e_pdf
+                    if usa_immagini:
+                        prompt += """
+                        IMMAGINI E FIGURE:
+                        - Se una domanda si riferisce a una figura, un grafico, un circuito o uno schema presente nel PDF, compila `pagina_immagine` (numero di pagina a partire da 1) e `box_immagine` come [ymin, xmin, ymax, xmax] su scala 0-1000.
+                        - Il riquadro `box_immagine` deve contenere SOLO la figura/grafico/schema, escludendo il testo circostante della slide che potrebbe rivelare la risposta.
+                        - Se la domanda non necessita di alcuna immagine, lascia `pagina_immagine` e `box_immagine` a null.
+                        """
+
                     if istruzioni_extra:
                         prompt += f"\nSegui attentamente queste istruzioni specifiche dell'utente:\n{istruzioni_extra}"
                     if esempi_quiz:
                         prompt += f"\nSegui rigorosamente lo stile, il tono e la difficoltà di questi esempi:\n{esempi_quiz}"
+
+                    # Percorso veloce (solo testo) vs percorso visivo (PDF completo)
+                    if not usa_immagini:
+                        testo_documento = (
+                            estrai_testo_pdf(pdf_bytes)
+                            if e_pdf
+                            else file_appunti.getvalue().decode("utf-8", errors="ignore").strip()
+                        )
+                        if len(testo_documento) > 100:
+                            contenuto_gemini = [f"DOCUMENTO:\n{testo_documento}\n\nISTRUZIONI:\n{prompt}"]
+                        else:
+                            # Fallback per PDF scansionati senza testo selezionabile
+                            uploaded_file = client_gemini.files.upload(
+                                file=file_appunti,
+                                config={"mime_type": file_appunti.type}
+                            )
+                            contenuto_gemini = [uploaded_file, prompt]
+                        schema_risposta = QuizSemplice
+                    else:
+                        uploaded_file = client_gemini.files.upload(
+                            file=file_appunti,
+                            config={"mime_type": file_appunti.type}
+                        )
+                        contenuto_gemini = [uploaded_file, prompt]
+                        schema_risposta = QuizConImmagini
 
                     modelli_disponibili = [
                         "gemini-4-hydrogen",
@@ -560,10 +608,10 @@ with tab_crea:
                         try:
                             response = client_gemini.models.generate_content(
                                 model=nome_modello,
-                                contents=[uploaded_file, prompt],
+                                contents=contenuto_gemini,
                                 config=types.GenerateContentConfig(
                                     response_mime_type="application/json",
-                                    response_schema=QuizGenerato,
+                                    response_schema=schema_risposta,
                                 ),
                             )
                             break
@@ -578,9 +626,8 @@ with tab_crea:
                     if response is None:
                         raise ultimo_errore
 
-                    quiz_pronto = QuizGenerato.model_validate_json(response.text)
+                    quiz_pronto = schema_risposta.model_validate_json(response.text)
 
-                    # Estrae e ritaglia eventuali immagini indicate da Gemini
                     domande_salvate = []
                     immagini_trovate = 0
                     for d in quiz_pronto.domande:
@@ -590,7 +637,7 @@ with tab_crea:
                             "risposta_corretta": d.risposta_corretta,
                             "spiegazione": d.spiegazione,
                         }
-                        if pdf_bytes and d.pagina_immagine and d.box_immagine:
+                        if usa_immagini and d.pagina_immagine and d.box_immagine:
                             img_b64 = estrai_ritaglio_pdf(pdf_bytes, d.pagina_immagine, d.box_immagine)
                             if img_b64:
                                 d_dict["immagine_b64"] = img_b64
