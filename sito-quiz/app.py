@@ -26,6 +26,10 @@ if not st.session_state["autenticato"]:
             st.error("Password errata. Riprova.")
     st.stop()
 
+# Stato per ricordare quale materia (quadrotto) è stata aperta
+if "materia_selezionata" not in st.session_state:
+    st.session_state["materia_selezionata"] = None
+
 # Connessione ai servizi tramite i "Secrets" di Streamlit
 client_gemini = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
@@ -57,18 +61,54 @@ tab_esercitati, tab_completati, tab_crea = st.tabs([
 ])
 
 # ==========================================
-# SCHEDA 1: ESERCITATI (SOLO QUIZ DA FARE)
+# SCHEDA 1: ESERCITATI (QUADROTTI MATERIE)
 # ==========================================
 with tab_esercitati:
-    if st.button("🔄 Aggiorna elenco"):
-        st.rerun()
+    materie = sorted(list(set(q["materia"] for q in quiz_da_fare)))
 
-    if not quiz_da_fare:
-        st.info("Hai completato tutti i quiz! Vai in '➕ Crea Nuovo' per generarne altri o in '✅ Completati' per rivedere lo storico.")
+    # Se la materia aperta non esiste più (eliminata o completata), torna alla griglia
+    if st.session_state["materia_selezionata"] not in materie:
+        st.session_state["materia_selezionata"] = None
+
+    # VISTA 1: GRIGLIA DI QUADROTTI (se nessuna materia è aperta)
+    if st.session_state["materia_selezionata"] is None:
+        if materie:
+            if st.button("🔄 Aggiorna"):
+                st.rerun()
+
+            st.write("")
+            # Crea i quadrotti a coppie (2 per riga)
+            for i in range(0, len(materie), 2):
+                cols = st.columns(2)
+                for j, col in enumerate(cols):
+                    if i + j < len(materie):
+                        mat = materie[i + j]
+                        n_quiz = sum(1 for q in quiz_da_fare if q["materia"] == mat)
+                        testo_quiz = "1 quiz" if n_quiz == 1 else f"{n_quiz} quiz"
+                        with col:
+                            if st.button(
+                                f"📚 **{mat}**\n\n{testo_quiz}",
+                                key=f"card_{mat}",
+                                use_container_width=True
+                            ):
+                                st.session_state["materia_selezionata"] = mat
+                                st.rerun()
+        # Se non ci sono materie, lo spazio rimane vuoto
+
+    # VISTA 2: QUIZ DENTRO LA MATERIA CLICCATA
     else:
-        # Filtra per materia
-        materie = sorted(list(set(q["materia"] for q in quiz_da_fare)))
-        materia_scelta = st.selectbox("Scegli la materia:", materie, key="mat_da_fare")
+        materia_scelta = st.session_state["materia_selezionata"]
+
+        col_top1, col_top2 = st.columns([2, 1])
+        with col_top1:
+            if st.button("⬅️ Torna alle materie"):
+                st.session_state["materia_selezionata"] = None
+                st.rerun()
+        with col_top2:
+            if st.button("🔄 Aggiorna", use_container_width=True):
+                st.rerun()
+
+        st.subheader(f"📚 {materia_scelta}")
 
         # Filtra i quiz della materia selezionata
         quiz_materia = [q for q in quiz_da_fare if q["materia"] == materia_scelta]
@@ -95,6 +135,7 @@ with tab_esercitati:
                 st.caption(f"Rimuove '{materia_scelta}' e tutti i suoi quiz.")
                 if st.button("Elimina materia", type="primary", key=f"del_mat_{materia_scelta}"):
                     supabase.table("quiz").delete().eq("materia", materia_scelta).execute()
+                    st.session_state["materia_selezionata"] = None
                     st.toast(f"Materia '{materia_scelta}' eliminata!")
                     st.rerun()
 
