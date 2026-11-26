@@ -1,4 +1,5 @@
 import time
+from datetime import datetime
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -41,31 +42,38 @@ class QuizGenerato(BaseModel):
 
 st.title("🧠 I Miei Quiz")
 
-# Navigazione a schede
-tab_esercitati, tab_crea = st.tabs(["📝 Esercitati", "➕ Crea Nuovo Quiz"])
+# Scarica tutti i quiz salvati nel database una volta sola
+risposta_db = supabase.table("quiz").select("*").order("created_at", desc=True).execute()
+tutti_i_quiz = risposta_db.data or []
+
+quiz_da_fare = [q for q in tutti_i_quiz if not q.get("completato")]
+quiz_completati = [q for q in tutti_i_quiz if q.get("completato")]
+
+# Navigazione a 3 schede
+tab_esercitati, tab_completati, tab_crea = st.tabs([
+    f"📝 Da Fare ({len(quiz_da_fare)})",
+    f"✅ Completati ({len(quiz_completati)})",
+    "➕ Crea Nuovo"
+])
 
 # ==========================================
-# SCHEDA 1: ESERCITATI CON I QUIZ SALVATI
+# SCHEDA 1: ESERCITATI (SOLO QUIZ DA FARE)
 # ==========================================
 with tab_esercitati:
-    if st.button("🔄 Aggiorna elenco quiz"):
+    if st.button("🔄 Aggiorna elenco"):
         st.rerun()
 
-    # Scarica tutti i quiz salvati nel database
-    risposta_db = supabase.table("quiz").select("*").order("created_at", desc=True).execute()
-    tutti_i_quiz = risposta_db.data
-
-    if not tutti_i_quiz:
-        st.info("Non hai ancora creato nessun quiz. Vai nella scheda 'Crea Nuovo Quiz' per iniziare!")
+    if not quiz_da_fare:
+        st.info("Hai completato tutti i quiz! Vai in '➕ Crea Nuovo' per generarne altri o in '✅ Completati' per rivedere lo storico.")
     else:
         # Filtra per materia
-        materie = sorted(list(set(q["materia"] for q in tutti_i_quiz)))
-        materia_scelta = st.selectbox("Scegli la materia:", materie)
+        materie = sorted(list(set(q["materia"] for q in quiz_da_fare)))
+        materia_scelta = st.selectbox("Scegli la materia:", materie, key="mat_da_fare")
 
-        # Filtra i quiz della materia selezionata (include l'ID per evitare sovrascritture)
-        quiz_materia = [q for q in tutti_i_quiz if q["materia"] == materia_scelta]
+        # Filtra i quiz della materia selezionata
+        quiz_materia = [q for q in quiz_da_fare if q["materia"] == materia_scelta]
         titoli = {f"{q['titolo']} (#{q['id']})": q for q in quiz_materia}
-        titolo_scelto = st.selectbox("Scegli il quiz:", list(titoli.keys()))
+        titolo_scelto = st.selectbox("Scegli il quiz:", list(titoli.keys()), key="tit_da_fare")
 
         quiz_attivo = titoli[titolo_scelto]
         domande = quiz_attivo["domande"]
@@ -84,7 +92,7 @@ with tab_esercitati:
 
             with col2:
                 st.markdown("**Elimina intera materia**")
-                st.caption(f"Rimuove '{materia_scelta}' e tutti i suoi {len(quiz_materia)} quiz.")
+                st.caption(f"Rimuove '{materia_scelta}' e tutti i suoi quiz.")
                 if st.button("Elimina materia", type="primary", key=f"del_mat_{materia_scelta}"):
                     supabase.table("quiz").delete().eq("materia", materia_scelta).execute()
                     st.toast(f"Materia '{materia_scelta}' eliminata!")
@@ -118,8 +126,61 @@ with tab_esercitati:
             st.balloons()
             st.info(f"🎯 Quiz completato! Punteggio finale: **{punteggio} / {len(domande)}**")
 
+            if st.button("✅ Salva e archivia in Completati", type="primary", use_container_width=True, key=f"archivia_{quiz_attivo['id']}"):
+                data_oggi = datetime.now().strftime("%d/%m/%Y %H:%M")
+                supabase.table("quiz").update({
+                    "completato": True,
+                    "punteggio": f"{punteggio} / {len(domande)}",
+                    "data_completamento": data_oggi
+                }).eq("id", quiz_attivo["id"]).execute()
+                st.toast("Quiz archiviato nella cartella Completati!")
+                st.rerun()
+
 # ==========================================
-# SCHEDA 2: CREA E SALVA UN NUOVO QUIZ
+# SCHEDA 2: CARTELLA QUIZ COMPLETATI
+# ==========================================
+with tab_completati:
+    if not quiz_completati:
+        st.info("Non hai ancora archiviato nessun quiz completato.")
+    else:
+        materie_comp = ["Tutte le materie"] + sorted(list(set(q["materia"] for q in quiz_completati)))
+        filtro_mat = st.selectbox("Filtra per materia:", materie_comp, key="filtro_comp")
+
+        lista_filtrata = (
+            quiz_completati if filtro_mat == "Tutte le materie"
+            else [q for q in quiz_completati if q["materia"] == filtro_mat]
+        )
+
+        for q in lista_filtrata:
+            punteggio_str = q.get("punteggio") or "N/D"
+            data_str = q.get("data_completamento") or "N/D"
+            etichetta = f"✅ {q['titolo']} ({q['materia']}) — Punteggio: {punteggio_str} | Data: {data_str}"
+
+            with st.expander(etichetta):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    if st.button("🔄 Rifai questo quiz", key=f"rifai_{q['id']}", use_container_width=True):
+                        supabase.table("quiz").update({
+                            "completato": False,
+                            "punteggio": None,
+                            "data_completamento": None
+                        }).eq("id", q["id"]).execute()
+                        st.toast("Quiz spostato di nuovo in 'Da Fare'!")
+                        st.rerun()
+                with col_b:
+                    if st.button("🗑️ Elimina definitivamente", key=f"del_comp_{q['id']}", use_container_width=True):
+                        supabase.table("quiz").delete().eq("id", q["id"]).execute()
+                        st.toast("Quiz eliminato!")
+                        st.rerun()
+
+                st.divider()
+                st.caption("Riepilogo domande e risposte corrette:")
+                for idx, d in enumerate(q["domande"]):
+                    st.markdown(f"**{idx+1}. {d['testo']}**")
+                    st.markdown(f"👉 *{d['risposta_corretta']}* — {d['spiegazione']}")
+
+# ==========================================
+# SCHEDA 3: CREA E SALVA UN NUOVO QUIZ
 # ==========================================
 with tab_crea:
     st.subheader("Genera un quiz con Gemini")
@@ -188,10 +249,11 @@ with tab_crea:
                     dati_da_salvare = {
                         "materia": materia.strip(),
                         "titolo": titolo.strip(),
-                        "domande": [d.model_dump() for d in quiz_pronto.domande]
+                        "domande": [d.model_dump() for d in quiz_pronto.domande],
+                        "completato": False
                     }
                     supabase.table("quiz").insert(dati_da_salvare).execute()
 
-                    st.success(f"Quiz '{titolo}' salvato in '{materia}'! Vai nella scheda 'Esercitati' per provarlo.")
+                    st.success(f"Quiz '{titolo}' salvato in '{materia}'! Vai nella scheda 'Da Fare' per provarlo.")
                 except Exception as e:
                     st.error(f"Si è verificato un errore: {e}")
