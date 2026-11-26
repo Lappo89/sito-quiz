@@ -2,7 +2,7 @@ import base64
 import hashlib
 import time
 from datetime import datetime
-import fitz  # PyMuPDF per testo rapido e ritaglio intelligente dai PDF
+import fitz  # PyMuPDF per testo rapido, ritaglio PDF e conversione SVG -> PNG
 import schemdraw
 import schemdraw.elements as elm
 import streamlit as st
@@ -11,7 +11,7 @@ from google.genai import types
 from pydantic import BaseModel
 from supabase import create_client
 
-# Usa il motore SVG integrato di schemdraw (veloce e senza bisogno di matplotlib)
+# Usa il motore SVG integrato di schemdraw
 schemdraw.use("svg")
 
 # Impostazione ottimizzata per smartphone
@@ -75,7 +75,6 @@ def renderizza_schemdraw(codice_py: str | None) -> str | None:
     if not codice_py or not codice_py.strip():
         return None
     try:
-        # Pulisce eventuali blocchi markdown ```python ... ```
         codice = codice_py.strip()
         if codice.startswith("```"):
             righe = codice.splitlines()
@@ -90,9 +89,76 @@ def renderizza_schemdraw(codice_py: str | None) -> str | None:
         }
         exec(codice, ambiente_sicuro)
         svg_bytes = d.get_imagedata("svg")
-        return svg_bytes.decode("utf-8")
+        svg_str = svg_bytes.decode("utf-8")
+        # Scarta SVG vuoti o privi di elementi disegnati
+        if len(svg_str) < 400 or ("<path" not in svg_str and "<line" not in svg_str):
+            return None
+        return svg_str
     except Exception:
         return None
+
+def svg_a_png_bytes(svg_str: str) -> bytes | None:
+    """Converte un SVG in PNG usando PyMuPDF così Gemini può ispezionarlo visivamente."""
+    try:
+        doc = fitz.open(stream=svg_str.encode("utf-8"), filetype="svg")
+        pix = doc[0].get_pixmap(dpi=150)
+        png_bytes = pix.tobytes("png")
+        doc.close()
+        return png_bytes
+    except Exception:
+        return None
+
+class VerificaCircuito(BaseModel):
+    ok: bool
+    motivo: str
+    schemdraw_code_corretto: str | None = None
+
+def genera_e_correggi_schemdraw(traccia: str, codice_iniziale: str | None) -> str | None:
+    """Disegna il circuito, lo fa guardare a Gemini e applica 1 correzione visiva se necessario."""
+    if not codice_iniziale:
+        return None
+
+    svg_iniziale = renderizza_schemdraw(codice_iniziale)
+    if not svg_iniziale:
+        return None
+
+    png_bytes = svg_a_png_bytes(svg_iniziale)
+    if not png_bytes:
+        return svg_iniziale
+
+    prompt_controllo = f"""
+    Guarda attentamente questa immagine di un circuito elettrico generato con Python `schemdraw` per il seguente esercizio:
+    TRACCIA: {traccia}
+
+    CODICE ATTUALE:
+    {codice_iniziale}
+
+    Valuta l'immagine:
+    1. Ci sono componenti sovrapposti (es. resistori disegnati sopra l'operazionale o etichette illeggibili)?
+    2. Ci sono fili scollegati, interrotti o che si incrociano a caso?
+    3. Lo schema è vuoto, tagliato o non corrisponde alla traccia?
+
+    - Se il circuito è pulito, ben collegato e leggibile, imposta `ok = true` e lascia `schemdraw_code_corretto = null`.
+    - Se ha difetti, imposta `ok = false` e scrivi in `schemdraw_code_corretto` il codice Python `schemdraw` CORRETTO usando SOLO l'oggetto `d` e `elm` (senza import, senza `with`, senza `d.draw()`). Usa gli agganci espliciti (`op.in1`, `op.in2`, `op.out`, `.at(...)`, `.to(...)`, `d.push()`, `d.pop()`) e distanzia bene i rami (`length=3` o `4`) per evitare sovrapposizioni.
+    """
+
+    try:
+        parte_img = types.Part.from_bytes(data=png_bytes, mime_type="image/png")
+        resp = genera_con_fallback([parte_img, prompt_controllo], VerificaCircuito)
+        esito = VerificaCircuito.model_validate_json(resp.text)
+
+        if esito.ok:
+            return svg_iniziale
+
+        if esito.schemdraw_code_corretto:
+            svg_corretto = renderizza_schemdraw(esito.schemdraw_code_corretto)
+            if svg_corretto:
+                return svg_corretto
+
+        # Se era rotto e la correzione ha fallito, meglio non mostrare uno schema sbagliato
+        return None
+    except Exception:
+        return svg_iniziale
 
 def mostra_testo_e_immagine(indice: int, item: dict, chiave_testo: str = "testo"):
     """Mostra il testo (domanda o traccia esercizio) e, se presente, l'immagine o lo schema di fianco."""
@@ -823,7 +889,7 @@ with tab_crea_es:
         "Gestione immagini / schemi per i nuovi esercizi:",
         [
             "⚡ Nessuna immagine (veloce)",
-            "🔌 Disegna nuovi circuiti (Schemdraw)",
+            "🔌 Disegna nuovi circuiti (Schemdraw + auto-correzione visiva)",
             "✂️ Ritaglia dal PDF originale"
         ],
         index=1,
@@ -841,9 +907,12 @@ with tab_crea_es:
         if not materia_es or not titolo_es or not file_esercizi:
             st.warning("Compila materia, titolo e carica un file o una foto con gli esercizi di partenza.")
         else:
+            usa_schemdraw = modalita_img_es.startswith("🔌")
+            usa_ritaglio = modalita_img_es.startswith("✂️") and (file_esercizi.type == "application/pdf")
+
             msg_spinner = (
-                "Gemini sta creando nuovi esercizi e disegnando i circuiti con Schemdraw..."
-                if modalita_img_es == "🔌 Disegna nuovi circuiti (Schemdraw)"
+                "Gemini sta creando gli esercizi, disegnando i circuiti e verificandoli visivamente..."
+                if usa_schemdraw
                 else "Gemini sta creando nuovi esercizi simili con svolgimento..."
             )
             with st.spinner(msg_spinner):
@@ -861,17 +930,26 @@ with tab_crea_es:
                     - `risultato_finale`: il risultato finale sintetico.
                     """
 
-                    usa_schemdraw = modalita_img_es == "🔌 Disegna nuovi circuiti (Schemdraw)"
-                    usa_ritaglio = modalita_img_es == "✂️ Ritaglia dal PDF originale" and e_pdf
-
                     if usa_schemdraw:
                         prompt += """
                         DISEGNO CIRCUITI CON SCHEMDRAW (Python):
-                        - Se l'esercizio coinvolge un circuito elettrico/elettronico, scrivi nel campo `schemdraw_code` SOLO il codice Python che aggiunge i componenti all'oggetto `d` (già inizializzato come `d = schemdraw.Drawing(show=False)`) usando `elm` (già importato come `import schemdraw.elements as elm`).
+                        - Se l'esercizio coinvolge un circuito elettrico/elettronico, scrivi nel campo `schemdraw_code` SOLO il codice Python che aggiunge i componenti all'oggetto `d` (già inizializzato) usando `elm`.
                         - NON scrivere `import`, NON scrivere `with schemdraw.Drawing()` e NON chiamare `d.draw()` o `d.save()`.
-                        - Usa elementi standard reali di schemdraw: `elm.Resistor()`, `elm.Capacitor()`, `elm.Inductor()`, `elm.SourceV()`, `elm.Ground()`, `elm.Opamp()`, `elm.Line()`, `elm.Dot()`, `elm.Arrow()`, `elm.Ic()`.
-                        - Usa `.right()`, `.left()`, `.up()`, `.down()`, `.at(...)`, `.to(...)`, `d.push()`, `d.pop()` per collegare correttamente tutti i nodi senza componenti scollegati o sovrapposti.
-                        - Metti etichette chiare con `.label('R1')`, `.label('VR')`, ecc. coerenti con la nuova traccia.
+                        - Usa sempre agganci espliciti (`.at(op.in1)`, `.at(op.in2)`, `.at(op.out)`, `.to(...)`) e `d.push()` / `d.pop()` per evitare componenti sovrapposti.
+                        - ESEMPIO CORRETTO DI OPERAZIONALE CON RETROAZIONE:
+                          op = d.add(elm.Opamp(leads=True))
+                          d += elm.Line().left(1).at(op.in1)
+                          d.push()
+                          d += elm.Resistor().left(3).label('R1')
+                          d += elm.Dot(open=True).label('Vin', loc='left')
+                          d.pop()
+                          d += elm.Line().up(2.5)
+                          d += elm.Resistor().right(4.5).label('Rf')
+                          d += elm.Line().down().toy(op.out)
+                          d += elm.Dot()
+                          d += elm.Line().left().tox(op.out)
+                          d += elm.Line().right(1.5).at(op.out).label('Vo', loc='right')
+                          d += elm.Ground().at(op.in2)
                         - Se l'esercizio non è un circuito, lascia `schemdraw_code` a null.
                         """
                     elif usa_ritaglio:
@@ -918,7 +996,7 @@ with tab_crea_es:
 
                     esercizi_salvati = []
                     immagini_trovate = 0
-                    for es in scheda_pronta.esercizi:
+                    for idx, es in enumerate(scheda_pronta.esercizi):
                         es_dict = {
                             "traccia": es.traccia,
                             "suggerimento": es.suggerimento,
@@ -926,9 +1004,9 @@ with tab_crea_es:
                             "risultato_finale": es.risultato_finale,
                         }
                         if usa_schemdraw and es.schemdraw_code:
-                            svg_renderizzato = renderizza_schemdraw(es.schemdraw_code)
-                            if svg_renderizzato:
-                                es_dict["svg_code"] = svg_renderizzato
+                            svg_finale = genera_e_correggi_schemdraw(es.traccia, es.schemdraw_code)
+                            if svg_finale:
+                                es_dict["svg_code"] = svg_finale
                                 immagini_trovate += 1
                         elif usa_ritaglio and es.pagina_immagine and es.box_immagine:
                             img_b64 = estrai_ritaglio_pdf(pdf_bytes, es.pagina_immagine, es.box_immagine)
@@ -946,7 +1024,7 @@ with tab_crea_es:
                     }
                     supabase.table("quiz").insert(dati_da_salvare).execute()
 
-                    msg_img = f" (con {immagini_trovate} schemi inclusi)" if immagini_trovate > 0 else ""
+                    msg_img = f" (con {immagini_trovate} schemi verificati)" if immagini_trovate > 0 else ""
                     st.success(f"Scheda '{titolo_es}' salvata in '{materia_es}'{msg_img}! Aprila da '📚 Le Mie Materie' → '✍️ Esercizi'.")
                 except Exception as e:
                     st.error(f"Si è verificato un errore: {e}")
